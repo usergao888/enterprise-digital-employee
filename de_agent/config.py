@@ -101,12 +101,22 @@ class Settings:
     rrf_k: int = 60
     enable_rerank: bool = True
     min_citation_support: float = 0.30
+    # Compound questions ("年假有几天，怎么申请") can be split into sub-queries and
+    # fused with weighted RRF. Measured on the bundled 8-doc corpus it did not
+    # help (see docs/eval_report.md §3), so it ships OFF and stays available for
+    # larger corpora: DE_ENABLE_DECOMPOSITION=true.
+    enable_decomposition: bool = False
+    max_sub_queries: int = 3
+    # Weight of each sub-query relative to the original question in RRF fusion.
+    sub_query_weight: float = 0.5
 
     # ---- Agent graph -----------------------------------------------------
     max_iterations: int = 6              # tool-calling iterations inside executor
     max_revisions: int = 1               # reviewer -> revise -> re-execute rounds
     recursion_limit: int = 40
     enable_reviewer: bool = True
+    # Park mutating tool calls for human confirmation instead of executing them.
+    require_confirmation: bool = False
 
     # ---- Paths -----------------------------------------------------------
     kb_dir: Path = field(default_factory=lambda: DEFAULT_KB_DIR)
@@ -141,10 +151,14 @@ class Settings:
             rrf_k=_env_int("DE_RRF_K", 60),
             enable_rerank=_env_bool("DE_ENABLE_RERANK", True),
             min_citation_support=_env_float("DE_MIN_CITATION_SUPPORT", 0.30),
+            enable_decomposition=_env_bool("DE_ENABLE_DECOMPOSITION", False),
+            max_sub_queries=_env_int("DE_MAX_SUB_QUERIES", 3),
+            sub_query_weight=_env_float("DE_SUB_QUERY_WEIGHT", 0.5),
             max_iterations=_env_int("DE_MAX_ITERATIONS", 6),
             max_revisions=_env_int("DE_MAX_REVISIONS", 1),
             recursion_limit=_env_int("DE_RECURSION_LIMIT", 40),
             enable_reviewer=_env_bool("DE_ENABLE_REVIEWER", True),
+            require_confirmation=_env_bool("DE_REQUIRE_CONFIRMATION", False),
             kb_dir=Path(_env("DE_KB_DIR", str(DEFAULT_KB_DIR))).resolve(),
             index_dir=Path(_env("DE_INDEX_DIR", str(DEFAULT_INDEX_DIR))).resolve(),
             host=_env("DE_HOST", "127.0.0.1"),

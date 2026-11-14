@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from .agents import DigitalEmployee, build_digital_employee
 from .config import Settings
@@ -101,6 +100,21 @@ def cmd_chat(args: argparse.Namespace) -> int:
             continue
         result = agent.ask(question)
         _print_result(result)
+        for action in result.get("pending_actions") or []:
+            print(f"\n待确认动作：{action['summary']}")
+            try:
+                reply = input("确认执行吗？(y/N) > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                reply = ""
+            if reply in {"y", "yes"}:
+                outcome = agent.confirm(action["action_id"])
+                if outcome["ok"]:
+                    print("已执行：" + str(outcome["result"])[:300])
+                else:
+                    print("执行失败：" + str(outcome["error"]))
+            else:
+                agent.cancel(action["action_id"])
+                print("已取消，未写入任何数据。")
     return 0
 
 

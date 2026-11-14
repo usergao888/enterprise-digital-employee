@@ -27,7 +27,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .config import Settings
 from .rag import HybridRetriever, hits_to_sources
+from .textutil import decompose_question
 
 MAX_ROWS = 50
 MAX_SQL_LENGTH = 600
@@ -92,9 +94,30 @@ class ToolResult:
     content: str
     latency_ms: float = 0.0
     error: str | None = None
+    pending_action_id: str | None = None
 
     def to_message_content(self) -> str:
         return self.content
+
+    @property
+    def pending(self) -> bool:
+        return self.pending_action_id is not None
+
+
+@dataclass
+class PendingAction:
+    action_id: str
+    tool: str
+    arguments: dict[str, Any]
+    created_at: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "action_id": self.action_id,
+            "tool": self.tool,
+            "arguments": self.arguments,
+            "summary": f"{self.tool}({json.dumps(self.arguments, ensure_ascii=False)[:120]})",
+        }
 
 
 @dataclass
@@ -120,6 +143,8 @@ class Tool:
 class ToolRegistry:
     tools: dict[str, Tool] = field(default_factory=dict)
     call_log: list[dict[str, Any]] = field(default_factory=list)
+    confirm_mutating: bool = False
+    pending: dict[str, PendingAction] = field(default_factory=dict)
 
     def register(self, tool: Tool) -> "ToolRegistry":
         self.tools[tool.name] = tool
@@ -131,8 +156,53 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self.tools)
 
+    # -- human-in-the-loop ---------------------------------------------
+    def confirm(self, action_id: str) -> ToolResult:
+        """Execute a previously parked mutating call (LangGraph `interrupt` analog)."""
+        action = self.pending.pop(action_id, None)
+        if action is None:
+            return ToolResult(
+                name="confirm",
+                ok=False,
+                content=json.dumps(
+                    {"error": f"待确认动作 {action_id} 不存在或已过期"}, ensure_ascii=False
+                ),
+                error="unknown_action",
+            )
+        return self._execute(self.tools[action.tool], action.arguments)
+
+    def cancel(self, action_id: str) -> dict[str, Any]:
+        removed = self.pending.pop(action_id, None)
+        return {"cancelled": removed is not None, "action_id": action_id}
+
+    def _park(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+        action = PendingAction(
+            action_id=f"act-{uuid.uuid4().hex[:8]}",
+            tool=tool.name,
+            arguments=arguments,
+            created_at=time.time(),
+        )
+        self.pending[action.action_id] = action
+        return ToolResult(
+            name=tool.name,
+            ok=True,
+            content=json.dumps(
+                {
+                    "status": "pending_confirmation",
+                    "action_id": action.action_id,
+                    "message": (
+                        f"`{tool.name}` 会修改数据，已暂存待人工确认；"
+                        "在确认前不要声称操作已完成。"
+                    ),
+                    "arguments": arguments,
+                },
+                ensure_ascii=False,
+            ),
+            pending_action_id=action.action_id,
+        )
+
+    # -- dispatch ------------------------------------------------------
     def call(self, name: str, arguments: dict[str, Any] | str) -> ToolResult:
-        started = time.perf_counter()
         tool = self.tools.get(name)
         if tool is None:
             return ToolResult(
@@ -168,9 +238,14 @@ class ToolRegistry:
                     {"error": "参数校验失败", "details": errors, "schema": tool.parameters},
                     ensure_ascii=False,
                 ),
-                latency_ms=round((time.perf_counter() - started) * 1000, 2),
                 error="bad_arguments",
             )
+        if tool.mutating and self.confirm_mutating:
+            return self._park(tool, arguments)
+        return self._execute(tool, arguments)
+
+    def _execute(self, tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+        started = time.perf_counter()
         try:
             result = tool.handler(**arguments)
             if isinstance(result, (dict, list)):
@@ -186,11 +261,11 @@ class ToolRegistry:
 
         latency = round((time.perf_counter() - started) * 1000, 2)
         self.call_log.append(
-            {"name": name, "ok": ok, "error": error, "latency_ms": latency,
+            {"name": tool.name, "ok": ok, "error": error, "latency_ms": latency,
              "arguments": arguments}
         )
         return ToolResult(
-            name=name, ok=ok, content=content, latency_ms=latency, error=error
+            name=tool.name, ok=ok, content=content, latency_ms=latency, error=error
         )
 
 
@@ -290,16 +365,44 @@ def build_registry(
     *,
     ticket_path: Path,
     db: sqlite3.Connection | None = None,
+    settings: Settings | None = None,
 ) -> ToolRegistry:
     db = db or _seed_employee_db()
     ticket_path.parent.mkdir(parents=True, exist_ok=True)
-    registry = ToolRegistry()
+    settings = settings or Settings()
+    registry = ToolRegistry(confirm_mutating=settings.require_confirmation)
 
     # -- knowledge search ---------------------------------------------
-    def knowledge_search(query: str, top_k: int = 5) -> dict[str, Any]:
-        result = retriever.search(query, k=min(int(top_k), 10))
+    def knowledge_search(
+        query: str, top_k: int = 5, sub_queries: list[str] | None = None
+    ) -> dict[str, Any]:
+        k = min(int(top_k), 10)
+        supplied = [str(s).strip() for s in (sub_queries or []) if str(s).strip()]
+        origin = "llm" if supplied else "none"
+        if not settings.enable_decomposition:
+            # Config switch wins over the model: lets the decomposition A/B run
+            # on identical inputs.
+            supplied, origin = [], "none"
+        elif not supplied:
+            # The model may forget to decompose; the tool still does it. This is
+            # why the feature works with models whose function-calling output is
+            # minimal, not just the ones that follow the planner prompt exactly.
+            supplied = decompose_question(query, max_parts=settings.max_sub_queries)
+            origin = "rule_fallback" if supplied else "none"
+
+        if supplied:
+            # Sub-queries are substrings of the original by construction, so only
+            # drop exact duplicates — filtering on "is a substring" deletes them all.
+            queries = [query] + [s for s in supplied if s != query]
+            result = retriever.search_multi(queries, k=k)
+        else:
+            result = retriever.search(query, k=k)
+
         return {
             "query": query,
+            "queries": result.queries,
+            "decomposed": len(result.queries) > 1,
+            "decomposed_by": origin,
             "found": len(result.hits),
             "results": [
                 {
@@ -322,12 +425,18 @@ def build_registry(
             description=(
                 "检索企业知识库（员工手册/IT 规范/财务报销/产品资料）。"
                 "回答任何涉及公司制度、流程、政策的问题前必须先调用。"
-                "返回按相关度排序的原文片段，片段带 index，用于在答案中标注 [index] 出处。"
+                "复合问题（如“年假有几天、怎么申请”）请拆成 sub_queries 一起检索，"
+                "只问一件事时留空。返回按相关度排序的原文片段，片段带 index，用于在答案中标注 [index] 出处。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "检索问题，保留关键实体与限定词"},
+                    "query": {"type": "string", "description": "用户的原始问题，保留关键实体与限定词"},
+                    "sub_queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "复合问题拆出的独立子查询，最多 3 条；单问题传空数组。与 query 一起做多路召回融合",
+                    },
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 10,
                               "default": 5, "description": "返回片段数"},
                 },

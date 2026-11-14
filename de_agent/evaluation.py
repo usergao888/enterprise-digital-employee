@@ -177,12 +177,70 @@ def _first_relevant_rank(
     return None
 
 
+def _doc_coverage(hits: list[dict[str, Any]], expected_docs: list[str]) -> float | None:
+    """Share of the expected documents that actually made it into the citations.
+
+    For a compound question the interesting failure is not "rank 3 instead of 1",
+    it is "only one of the two documents was ever retrieved".
+    """
+    if not expected_docs:
+        return None
+    seen = {hit.get("doc_id") for hit in hits}
+    return sum(1 for doc in expected_docs if doc in seen) / len(expected_docs)
+
+
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, int(round(pct / 100 * (len(ordered) - 1)))))
     return round(ordered[index], 2)
+
+
+def decomposition_ablation(agent: Any) -> dict[str, Any]:
+    """A/B the same questions with query decomposition on vs off.
+
+    Toggling `settings.enable_decomposition` is enough because the tool reads it
+    at call time — no need to rebuild the agent or the index.
+    """
+    cases = [c for c in GOLDEN if c.intent == "kb" and c.expected_docs]
+    original = agent.settings.enable_decomposition
+
+    def run(enabled: bool) -> dict[str, Any]:
+        agent.settings.enable_decomposition = enabled
+        keyword_hits = 0
+        cited = 0
+        decomposed = 0
+        coverage_sum = 0.0
+        coverage_n = 0
+        for case in cases:
+            result = agent.ask(case.question, fresh_memory=True)
+            answer = result.get("answer", "")
+            if all(keyword in answer for keyword in case.expected_keywords):
+                keyword_hits += 1
+            citations = result.get("citations") or {}
+            if citations.get("cited", 0) > 0 and citations.get("existing"):
+                cited += 1
+            if (result.get("retrieval") or {}).get("decomposed"):
+                decomposed += 1
+            coverage = _doc_coverage(result.get("sources") or [], case.expected_docs)
+            if coverage is not None:
+                coverage_sum += coverage
+                coverage_n += 1
+        total = max(1, len(cases))
+        return {
+            "keyword_hit": round(keyword_hits / total, 4),
+            "citation_ok": round(cited / total, 4),
+            "doc_coverage": round(coverage_sum / coverage_n, 4) if coverage_n else 0.0,
+            "decomposed": decomposed,
+        }
+
+    try:
+        on = run(True)
+        off = run(False)
+    finally:
+        agent.settings.enable_decomposition = original
+    return {"cases": len(cases), "on": on, "off": off}
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +322,7 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
             ok_tool = True
             recall = None
             mrr = None
+            coverage = None
             ok_cite = True
             ok_keyword = True
         else:
@@ -273,6 +332,7 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
             rank = _first_relevant_rank(result.get("sources") or [], case.expected_docs)
             recall = (1.0 if rank else 0.0) if case.expected_docs else None
             mrr = (1.0 / rank if rank else 0.0) if case.expected_docs else None
+            coverage = _doc_coverage(result.get("sources") or [], case.expected_docs)
             citations = result.get("citations") or {}
             ok_cite = (
                 (int(citations.get("cited", 0)) > 0 and bool(citations.get("existing", False)))
@@ -292,9 +352,12 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
                 "tool_ok": ok_tool,
                 "retrieval_recall": recall,
                 "mrr": mrr,
+                "doc_coverage": coverage,
                 "citation_ok": ok_cite,
                 "keyword_ok": ok_keyword,
                 "blocked": blocked,
+                "decomposed": bool((result.get("retrieval") or {}).get("decomposed")),
+                "sub_queries": (result.get("retrieval") or {}).get("queries", []),
                 "latency_ms": round(latency, 2),
                 "answer_head": answer[:100].replace("\n", " "),
                 "usage": result.get("usage", {}),
@@ -303,6 +366,7 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
         )
 
     kb_rows = [r for r in rows if r["retrieval_recall"] is not None]
+    decomposed = [r for r in rows if r["decomposed"]]
     latencies = [r["latency_ms"] for r in rows]
     total_cost = round(sum(r["usage"].get("total_cost_cny", 0) for r in rows), 6)
     baseline = round(sum(r["usage"].get("single_model_baseline_cny", 0) for r in rows), 6)
@@ -316,12 +380,25 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
         if kb_rows
         else 0.0,
         "mrr": round(statistics.mean([r["mrr"] for r in kb_rows]), 4) if kb_rows else 0.0,
+        "doc_coverage": round(
+            statistics.mean(
+                [r["doc_coverage"] for r in kb_rows if r["doc_coverage"] is not None]
+            ),
+            4,
+        )
+        if kb_rows
+        else 0.0,
         "citation_rate": round(
             statistics.mean([1.0 if r["citation_ok"] else 0.0 for r in rows]), 4
         ),
         "answer_keyword_hit": round(
             statistics.mean([1.0 if r["keyword_ok"] else 0.0 for r in rows]), 4
         ),
+        "decomposed_questions": len(decomposed),
+        "decomposition_examples": [
+            {"question": r["question"], "sub_queries": r["sub_queries"][1:]}
+            for r in decomposed[:3]
+        ],
         "latency_p50_ms": _percentile(latencies, 50),
         "latency_p95_ms": _percentile(latencies, 95),
         "total_cost_cny": total_cost,
@@ -335,7 +412,11 @@ def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
-def render_markdown(report: dict[str, Any], ablation: list[dict[str, Any]]) -> str:
+def render_markdown(
+    report: dict[str, Any],
+    ablation: list[dict[str, Any]],
+    decomp: dict[str, Any] | None = None,
+) -> str:
     s = report["summary"]
     lines: list[str] = []
     lines.append("# 企业数字员工 Agent · 离线评测报告")
@@ -351,8 +432,13 @@ def render_markdown(report: dict[str, Any], ablation: list[dict[str, Any]]) -> s
     lines.append(f"| 工具选择准确率 | {s['tool_accuracy']:.1%} | 实际调用的工具是否符合预期 |")
     lines.append(f"| 检索 Recall@5 | {s['retrieval_recall@5']:.1%} | 正确文档是否进入前 5 |")
     lines.append(f"| 检索 MRR | {s['mrr']:.3f} | 正确文档的平均倒数排名 |")
+    lines.append(f"| 多文档覆盖率 | {s['doc_coverage']:.1%} | 跨文档复合问题中，期望文档被引用的比例 |")
     lines.append(f"| 引用合规率 | {s['citation_rate']:.1%} | 制度类答案带有效角标 |")
     lines.append(f"| 答案关键信息命中 | {s['answer_keyword_hit']:.1%} | 预期数字/术语是否出现 |")
+    lines.append(
+        f"| 复合问题分解 | {s['decomposed_questions']} / {s['cases']} 条 | "
+        "规划器拆子查询后多路召回融合，单问题不触发 |"
+    )
     lines.append(f"| P50 / P95 延迟 | {s['latency_p50_ms']} / {s['latency_p95_ms']} ms | 端到端（离线后端） |")
     lines.append(
         f"| 多模型路由成本 | ¥{s['total_cost_cny']:.6f} vs 单模型 ¥{s['single_model_baseline_cny']:.6f}"
@@ -381,7 +467,32 @@ def render_markdown(report: dict[str, Any], ablation: list[dict[str, Any]]) -> s
         "换成真实 embedding 后重跑本脚本即可看到语义召回的增益。"
     )
     lines.append("")
-    lines.append("## 三、逐条明细")
+    lines.append("## 三、Query Decomposition 消融")
+    lines.append("")
+    if decomp:
+        lines.append("同一批制度类问题，只切换子查询分解开关：")
+        lines.append("")
+        lines.append("| 配置 | 多文档覆盖率 | 关键信息命中 | 触发分解题数 |")
+        lines.append("| --- | --- | --- | --- |")
+        lines.append(
+            f"| 单查询（分解关闭） | {decomp['off']['doc_coverage']:.1%} | "
+            f"{decomp['off']['keyword_hit']:.1%} | {decomp['off']['decomposed']} |"
+        )
+        lines.append(
+            f"| 多路召回（分解开启） | {decomp['on']['doc_coverage']:.1%} | "
+            f"{decomp['on']['keyword_hit']:.1%} | {decomp['on']['decomposed']} |"
+        )
+        lines.append("")
+        lines.append(
+            f"> 共 {decomp['cases']} 条制度类问题。只有包含两个可独立检索子问题的才会触发分解，"
+            "单问题不受影响。本语料下「多文档覆盖率」已经饱和（单次 top-5 本来就能跨文档），"
+            "「关键信息命中」也不会因此变高 —— 答案里的数字本来就不是问题里出现过的词。"
+            "结论：分解在这里**既不亏也不赚**，所以默认关闭，等语料规模上去再评估。"
+        )
+    else:
+        lines.append("（未运行）")
+    lines.append("")
+    lines.append("## 四、逐条明细")
     lines.append("")
     lines.append("| # | 问题 | 意图 | 工具 | Recall | 引用 | 关键信息 | 延迟 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
@@ -403,14 +514,25 @@ def render_markdown(report: dict[str, Any], ablation: list[dict[str, Any]]) -> s
 def run_evaluation(agent: Any, out_dir: Path) -> dict[str, Any]:
     report = evaluate_agent(agent)
     ablation = retrieval_ablation(agent)
-    markdown = render_markdown(report, ablation)
+    decomp = decomposition_ablation(agent)
+    markdown = render_markdown(report, ablation, decomp)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "eval_report.md").write_text(markdown, encoding="utf-8")
     (out_dir / "eval_report.json").write_text(
-        json.dumps({"summary": report["summary"], "rows": report["rows"], "ablation": ablation},
-                   ensure_ascii=False, indent=2, default=str),
+        json.dumps(
+            {
+                "summary": report["summary"],
+                "rows": report["rows"],
+                "ablation": ablation,
+                "decomposition_ablation": decomp,
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ),
         encoding="utf-8",
     )
     report["ablation"] = ablation
+    report["decomposition_ablation"] = decomp
     report["markdown"] = markdown
     return report

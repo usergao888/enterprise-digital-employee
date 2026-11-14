@@ -126,6 +126,68 @@ class TestAgentEndToEnd(unittest.TestCase):
             clean_tmp(agent.settings.index_dir)
 
 
+class TestHumanInTheLoop(unittest.TestCase):
+    """Mutating tools must be parked for confirmation, not executed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = make_tmp()
+        settings = Settings(
+            llm_backend="fake",
+            kb_dir=ROOT / "data" / "kb",
+            index_dir=cls._tmp,
+            require_confirmation=True,
+        )
+        cls.agent = DigitalEmployee(settings)
+        cls.agent.ingest()
+
+    @classmethod
+    def tearDownClass(cls):
+        clean_tmp(cls._tmp)
+
+    def _ticket_count(self) -> int:
+        path = self._tmp / "tickets.json"
+        if not path.exists():
+            return 0
+        return len(json.loads(path.read_text(encoding="utf-8")))
+
+    def test_mutating_tool_is_parked(self):
+        before = self._ticket_count()
+        result = self.agent.ask("电脑蓝屏了，帮我报修一下", fresh_memory=True)
+        self.assertEqual(len(result["pending_actions"]), 1)
+        action = result["pending_actions"][0]
+        self.assertEqual(action["tool"], "create_ticket")
+        self.assertIn("待确认", result["answer"])
+        self.assertNotIn("TCK-", result["answer"])
+        # nothing new was written while waiting for confirmation
+        self.assertEqual(self._ticket_count(), before)
+
+    def test_confirm_executes_the_action(self):
+        result = self.agent.ask("电脑蓝屏了，帮我报修一下", fresh_memory=True)
+        action_id = result["pending_actions"][0]["action_id"]
+        before = self._ticket_count()
+        done = self.agent.confirm(action_id)
+        self.assertTrue(done["ok"])
+        self.assertIn("TCK-", done["result"])
+        self.assertEqual(self._ticket_count(), before + 1)
+
+    def test_cancel_discards_the_action(self):
+        result = self.agent.ask("电脑蓝屏了，帮我报修一下", fresh_memory=True)
+        action_id = result["pending_actions"][0]["action_id"]
+        cancelled = self.agent.cancel(action_id)
+        self.assertTrue(cancelled["cancelled"])
+        self.assertEqual(self.agent.registry.pending, {})
+
+    def test_unknown_action_is_rejected(self):
+        outcome = self.agent.confirm("act-doesnotexist")
+        self.assertFalse(outcome["ok"])
+
+    def test_read_only_tools_are_not_gated(self):
+        result = self.agent.ask("一线城市出差住宿每晚能报多少？", fresh_memory=True)
+        self.assertEqual(result["pending_actions"], [])
+        self.assertIn("500", result["answer"])
+
+
 class TestConversationMemory(unittest.TestCase):
     def test_window_and_summary(self):
         memory = ConversationMemory(window=2, summarise_after=4)

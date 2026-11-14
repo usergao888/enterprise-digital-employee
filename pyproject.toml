@@ -23,7 +23,8 @@ dev = ["pytest>=8.0"]
 de-agent = "de_agent.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/your-name/enterprise-digital-employee"
+Homepage = "https://github.com/usergao888/enterprise-digital-employee"
+Repository = "https://github.com/usergao888/enterprise-digital-employee"
 
 [tool.setuptools.packages.find]
 include = ["de_agent*"]

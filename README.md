@@ -1,16 +1,15 @@
 # 企业数字员工 Agent（Enterprise Digital Employee）
 
-<!-- 仓库建好后，把下面两行注释删掉，并把 your-name 换成你的 GitHub 用户名：
-![tests](https://github.com/your-name/enterprise-digital-employee/actions/workflows/ci.yml/badge.svg)
+![tests](https://github.com/usergao888/enterprise-digital-employee/actions/workflows/ci.yml/badge.svg)
 ![python](https://img.shields.io/badge/python-3.10%20%7C%203.12-blue)
--->
+![license](https://img.shields.io/badge/license-MIT-green)
 
 > 一个**能离线跑、有评测数据、可拆开讲**的 Python AI Agent 工程：LangGraph 风格状态图编排 + 混合检索 RAG + JSON-Schema Tool Calling + 向量库 + 多模型路由 + 引用溯源 + 多智能体审核闭环。
 
 这不是一个"调用 OpenAI 接口的 demo"。它把企业知识问答里真正会卡住的地方都做了一遍：中文分块、双路召回、角标可追溯、工具参数校验、写完操作的 SLA、审核不通过自动重写、以及**用代码跑出来的指标**而不是简历上拍的百分比。
 
 ```
-Python 3.10+ · numpy 是唯一硬依赖 · 58 个单元/集成测试 · 无需 GPU / 无需 API Key
+Python 3.10+ · numpy 是唯一硬依赖 · 70 个单元/集成测试 · 无需 GPU / 无需 API Key
 ```
 
 ---
@@ -80,7 +79,7 @@ python -m de_agent ask "一线城市出差住宿每晚能报多少？" --trace
 python -m de_agent chat            # 多轮对话
 python -m de_agent eval            # 跑评测集，产出 var/index/eval_report.md
 python -m de_agent serve           # 打开 http://127.0.0.1:8710 有网页版
-python -m unittest discover -s tests -t .    # 58 个测试
+python -m unittest discover -s tests -t .    # 70 个测试
 ```
 
 接真实模型（默认是离线后端，不需要 Key）：
@@ -106,25 +105,37 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 | 意图路由准确率 | 100.0% |
 | 工具选择准确率 | 100.0% |
 | 检索 Recall@5 / MRR | 100.0% / 1.000 |
+| 多文档覆盖率 | 100.0% |
 | 引用合规率（角标存在且可回溯） | 100.0% |
 | 答案关键信息命中 | 86.7% |
-| P50 / P95 延迟 | 28.1 / 36.6 ms（离线后端，仅反映编排+检索开销） |
-| 多模型路由成本 | ¥0.0770 vs 全量走大模型 ¥0.1815，**省 57.6%** |
+| P50 / P95 延迟 | 7.1 / 9.9 ms（离线后端，仅反映编排+检索开销） |
+| 多模型路由成本 | ¥0.0833 vs 全量走大模型 ¥0.1917，**省 56.6%** |
 
 检索策略消融（18 条含精确数字/编号与改写类问题）：
 
 | 检索策略 | Recall@1 | MRR | 平均耗时 |
 | --- | --- | --- | --- |
-| 纯向量检索 | 88.9% | 0.944 | 1.10 ms |
-| 纯 BM25 | 94.4% | 0.972 | 1.15 ms |
-| 双路召回 + RRF | 94.4% | 0.972 | 1.13 ms |
-| 双路召回 + RRF + 重排 | 94.4% | 0.972 | 2.29 ms |
+| 纯向量检索 | 88.9% | 0.944 | 1.36 ms |
+| 纯 BM25 | 88.9% | 0.944 | 1.59 ms |
+| 双路召回 + RRF | 94.4% | 0.972 | 1.39 ms |
+| 双路召回 + RRF + 重排（默认） | 94.4% | 0.972 | 2.96 ms |
 
 **关于这组数字的诚实说明**（面试被问到时必须主动讲，否则会被当成吹牛）：
 
 1. 离线模式用的是**哈希向量**（非语义模型），所以"向量 vs BM25"的差距被系统性低估。换成真实 embedding 重跑同一脚本，语义召回的增益才会显出来 —— 脚本里 `retrieval_ablation()` 就是为这件事准备的。
-2. 86.7% 不是 100%，因为抽取式答案只取最有依据的 4 句，有两题漏掉了关键数字（"身份证""电源"）。**我知道它为什么漏**：top-1 命中的是正确文档，但选中的是相邻段落 —— 这正是下一步要做 query decomposition（把问题拆成"带什么""怎么办"两个子查询）的原因。
-3. 延迟是离线后端的开销，**不代表真实模型耗时**，报告里已显式标注。
+2. 86.7% 不是 100%，因为抽取式答案只取最有依据的 3 句，有两题漏掉了关键数字（"身份证""电源"）。**我知道它为什么漏**：这两处的答案词（身份证、电源）根本不在问题里出现，词面匹配跨不过去 —— 换真实 LLM 或语义 embedding 才是正解。
+3. **重排在本语料上没有额外 Recall@1 增益**（94.4% 持平，耗时翻倍）。融合已经把正确的 chunk 排到第一，重排只能在更大的候选池里发挥作用。它保留为可开关项，默认开、可关。
+4. 延迟是离线后端的开销，**不代表真实模型耗时**，报告里已显式标注。
+
+### 三个"我做了 A/B 之后才知道"的记录
+
+这三条比涨几个点更有价值，因为它们是**推翻自己假设**的证据：
+
+| 我做了什么 | 假设 | 实测结果 | 处置 |
+| --- | --- | --- | --- |
+| **Query Decomposition**（复合问题拆子查询 + 加权 RRF 融合） | 拆子查询能提升复合问题的答案覆盖率 | 多文档覆盖率、关键信息命中**都没有变化**；8 篇文档、59 个 chunk 的语料上，单次 top-5 本来就跨文档 | 功能保留、**默认关闭**（`DE_ENABLE_DECOMPOSITION`），等语料上量再开 |
+| **`keyword_overlap` 去掉单字匹配** | 去掉噪声能提升重排质量 | 短句"拨打分机 8000 催单"不再靠一个"机"字挤掉正确答案；"电脑开不了机"现在会引用"先确认电源" | **保留**（这是真 bug 修复） |
+| **检查点无上限 + 每节点全量重写** | 无界存储没什么影响 | 跑几百次评测后 P50 从 16 ms 退化到 77 ms，文件越长越慢 | 加线程上限 64 + 每 4 个节点批量落盘，恢复 **7 ms** |
 
 ---
 
@@ -144,7 +155,11 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 纯模型审核会"和稀泥"：它看到有角标就放过，但角标可能指向一段根本不支撑结论的原文。所以 `citation_report()` 用**确定性规则**做第二道：角标指向的 chunk 是否包含问题关键词。模型负责"答没答到点上"，规则负责"引没引对地方"，两者取并集才判定 revise。
 
 **5. 多模型路由怎么证明它真省钱？**
-每个 stage 声明负载档位：plan/review 走强模型（要推理），execute 走便宜模型（长上下文、大量 token）；超长问题升级到强模型。`MeteredRouter` 对**每次调用**按 stage 记账，同时算出"全量走强模型"的基线成本，差值就是节省率。57.6% 是这么跑出来的，不是估的。
+每个 stage 声明负载档位：plan/review 走强模型（要推理），execute 走便宜模型（长上下文、大量 token）；超长问题升级到强模型。`MeteredRouter` 对**每次调用**按 stage 记账，同时算出"全量走强模型"的基线成本，差值就是节省率。56.6% 是这么跑出来的，不是估的。
+
+**6. 写操作为什么要单独造一个确认门？**
+Agent 最危险的不是答错，是**在没人同意的情况下把事办了**。`create_ticket` 标了 `mutating=True`，开启确认后 `ToolRegistry.call()` 不执行、只返回 `pending_confirmation + action_id`；`node_execute` 拿到这个结果就停止工具循环，把"待确认动作"交给用户，`agent.confirm(id)` 才真正落库。测试里专门断言了"未确认前，答案里不得出现工单号，tickets.json 不得新增"。
+> 这正是 LangGraph `interrupt()` 的语义，只是这里用应用层实现，换真 LangGraph 时可以直接替换。
 
 ---
 
@@ -152,13 +167,13 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 
 | JD 要求 | 本工程证据 |
 | --- | --- |
-| **Python** | 全量 Python 3.10+，`de_agent/` 11 个模块，58 个测试 |
+| **Python** | 全量 Python 3.10+，`de_agent/` 12 个模块，70 个测试 |
 | **至少一种主流 Agent 框架（LangChain/LangGraph/Dify）** | `graph.py` 自研 LangGraph 同构引擎 + `langgraph_adapter.py` 可直接切真 LangGraph |
-| **RAG** | 结构化分块 → 双路召回 → RRF → 重排 → 引用溯源 → 消融实验（`rag.py`） |
-| **Tool Calling** | 6 个工具、标准 JSON Schema、参数校验、异常兜底、写操作标记（`tools.py`） |
+| **RAG** | 结构化分块 → 双路召回 → 加权 RRF → 重排 → 引用溯源 → 消融实验（`rag.py`） |
+| **Tool Calling** | 6 个工具、标准 JSON Schema、参数校验、异常兜底、写操作标记 + **人工确认门**（`tools.py`） |
 | **向量库** | 内存版(numpy)+JSON 持久化，另附 Chroma / Qdrant 适配器（`vectorstore.py`） |
 | 加分：大模型应用 | 多模型路由 + 成本核算 + 流式 SSE + 会话记忆 + Prompt 注入防护 |
-| 加分：工程规范 | 类型注解、docstring 说明取舍、`unittest` 覆盖、可观测的 step trace |
+| 加分：工程规范 | 类型注解、docstring 说明取舍、`unittest` 覆盖、可观测的 step trace、A/B 实验结论可复跑 |
 
 ---
 
@@ -172,6 +187,8 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 6. **怎么评估 RAG 好不好？** 见 `evaluation.py`：检索侧 Recall@k / MRR（有标注的期望文档），生成侧引用合规率 / 关键信息命中率，系统侧 P50/P95 延迟与成本。
 7. **如果线上量级上来呢？** 向量库换 Qdrant（已留适配器）、embedding 换 batch 接口、把同步工具改异步、知识库按部门做租户隔离、审核节点做成可配置开关以降延迟。
 8. **LangGraph 的 checkpointer 解决什么？** 断点续跑与人机协同：`create_ticket` 这种写操作可以 `interrupt()` 等人工确认，确认后从断点继续，而不是重跑整条链。
+9. **Agent 怎么防止越权写数据？** `DE_REQUIRE_CONFIRMATION=true` 后，标记 `mutating=True` 的工具不会立即执行，而是返回 `pending_confirmation` + `action_id`，图在拿到这个结果时就停下来让 Agent 请求确认；`agent.confirm(action_id)` 才真正落库，`cancel` 则丢弃。测试里 `TestHumanInTheLoop` 覆盖了"未确认前不得声称已创建工单"。
+10. **你的功能都有效果吗？** 不都有效。子查询分解我做了完整实现和 A/B，在本语料上**没有增益**，所以默认关闭；重排在本语料上也只有耗时没有 Recall 提升。反过来，单字匹配噪声修复让答案不再引用错段落，checkpointer 上限修复把 P50 从 77ms 拉回 7ms —— 这三条都写在评测报告里。
 
 ---
 
@@ -194,7 +211,7 @@ enterprise-agent/
 │   ├── server.py              # stdlib HTTP + SSE + 网页版
 │   └── langgraph_adapter.py   # 切到真 LangGraph
 ├── data/kb/                   # 8 篇制度文档（差旅/考勤/IT/财务/入职/薪酬/产品）
-├── tests/                     # 58 个测试（含 HTTP/SSE 端到端）
+├── tests/                     # 70 个测试（含 HTTP/SSE 端到端）
 ├── var/index/                 # 索引、工单、检查点、评测报告（运行产物）
 ├── requirements.txt · pyproject.toml · .env.example
 └── README.md
@@ -206,8 +223,9 @@ enterprise-agent/
 
 - 离线 `FakeLLM` 是**规则替身**，只用于跑通链路与做回归测试；它的"意图判断"是正则，不代表真实模型的泛化能力。
 - 哈希向量不是语义模型，检索质量的真实上限要在接入 `text-embedding-v3` / BGE-M3 后重测。
-- 未做：query decomposition（当前 86.7% 关键信息命中的主要短板）、多轮改写指代消解、知识库增量更新、RAGAS 式 faithfulness 评测。
-- 未做：`create_ticket` 的人工确认中断（adapter 里已注明可用 `interrupt()` 实现）。
+- 未做：多轮指代改写（"那病假呢"这类省略主语的追问）、知识库增量更新与删除、RAGAS 式 faithfulness 评测、真实模型下的端到端延迟。
+- 未做：`action_id` 持久化 —— 待确认动作存在内存里，进程重启就失效，要真正用于生产得落库并加过期时间。
+- `create_ticket` 的确认目前是"应用层 interrupt"（图停下来 + 显式 confirm），真 LangGraph 下可换成原生 `interrupt()`，adapter 里已注明。
 
 ## 十、License
 

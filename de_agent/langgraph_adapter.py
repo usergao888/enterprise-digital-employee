@@ -78,7 +78,10 @@ def build_langgraph_agent(agent: Any) -> Any:
     )
     graph.add_edge("revise", "execute")
     graph.add_edge("finalize", LG_END)
-    return graph.compile(checkpointer=MemorySaver())
+    app = graph.compile(checkpointer=MemorySaver())
+    # Cache on the agent so repeated calls don't rebuild the runtime.
+    agent.langgraph_app = app
+    return app
 
 
 def ask_with_langgraph(agent: Any, question: str, thread_id: str = "default") -> dict[str, Any]:

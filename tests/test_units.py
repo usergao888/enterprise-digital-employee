@@ -11,8 +11,8 @@ sys.path.insert(0, str(ROOT))
 
 from tests.support import clean_tmp, make_tmp
 
-from de_agent.graph import END, START, GraphError, MemoryCheckpointer, StateGraph
-from de_agent.llm import Message, detect_intent, estimate_tokens
+from de_agent.graph import END, FileCheckpointer, GraphError, MemoryCheckpointer, StateGraph
+from de_agent.llm import detect_intent, estimate_tokens
 from de_agent.rag import (
     BM25Index,
     chunk_document,
@@ -21,7 +21,12 @@ from de_agent.rag import (
     reciprocal_rank_fusion,
     _split_sections,
 )
-from de_agent.textutil import keyword_overlap, split_sentences, tokenize
+from de_agent.textutil import (
+    decompose_question,
+    keyword_overlap,
+    split_sentences,
+    tokenize,
+)
 from de_agent.tools import guard_sql, safe_eval, validate_arguments
 from de_agent.vectorstore import Chunk, Hit, MemoryVectorStore
 from de_agent.agents import extract_json, guard_input
@@ -48,6 +53,26 @@ class TestTextUtil(unittest.TestCase):
     def test_keyword_overlap_bounds(self):
         self.assertEqual(keyword_overlap("", "x"), 0.0)
         self.assertGreater(keyword_overlap("年假 天数", "年假有 5 天"), 0.0)
+
+    def test_keyword_overlap_ignores_single_chars(self):
+        # A short sentence sharing only the character 机 must not outrank a
+        # longer one; unigram matches are noise for reranking.
+        question = "电脑开不了机怎么办"
+        short_noise = "拨打分机 8000 催单。"
+        self.assertEqual(keyword_overlap(question, short_noise), 0.0)
+
+    def test_decompose_compound_question(self):
+        self.assertEqual(
+            decompose_question("年假有几天，怎么申请？"), ["年假有几天", "怎么申请"]
+        )
+
+    def test_decompose_single_clause_returns_empty(self):
+        self.assertEqual(decompose_question("一线城市出差住宿每晚能报多少？"), [])
+        self.assertEqual(decompose_question(""), [])
+
+    def test_decompose_respects_max_parts(self):
+        parts = decompose_question("年假几天，病假要什么材料，婚假怎么请", max_parts=2)
+        self.assertEqual(len(parts), 2)
 
     def test_estimate_tokens(self):
         self.assertEqual(estimate_tokens(""), 0)
@@ -84,6 +109,19 @@ class TestChunking(unittest.TestCase):
         chunks = chunk_document("d", "标题", text, size=120, overlap=40)
         self.assertGreater(len(chunks), 3)
         self.assertTrue(all(len(c.text) <= 260 for c in chunks))
+
+    def test_short_preamble_is_merged_into_first_section(self):
+        # A 30-char "本流程描述…" preamble must not become its own retrievable
+        # chunk — it ranks high on the doc title and contains no answer.
+        text = (
+            "# 测试流程\n\n"
+            "本流程描述从录用到转正的全部节点。\n\n"
+            "## 一、材料\n\n"
+            "需要身份证原件、学历证书与离职证明，材料不齐最迟 5 个工作日内补齐。\n"
+        )
+        chunks = chunk_document("d", "测试流程", text, size=520, overlap=90)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("身份证", chunks[0].text)
 
     def test_load_documents_reads_sample_kb(self):
         docs = load_documents(ROOT / "data" / "kb")
@@ -127,6 +165,19 @@ class TestFusionAndCitation(unittest.TestCase):
         fused = reciprocal_rank_fusion([dense, sparse], k=60, limit=3)
         self.assertIn(fused[0].chunk.chunk_id, {"a", "b"})
         self.assertEqual(fused[-1].chunk.chunk_id, "c")
+
+    def test_rrf_weights_let_the_primary_query_win(self):
+        primary = [self._hit("x", 1.0), self._hit("y", 0.5)]
+        noisy = [self._hit("y", 1.0), self._hit("x", 0.5)]
+        unweighted = reciprocal_rank_fusion([primary, noisy], k=60, limit=2)
+        weighted = reciprocal_rank_fusion(
+            [primary, noisy], k=60, limit=2, weights=[1.0, 0.1]
+        )
+        self.assertEqual(weighted[0].chunk.chunk_id, "x")
+        self.assertNotEqual(
+            [hit.chunk.chunk_id for hit in unweighted],
+            [],
+        )
 
     def test_citation_report_flags_missing_index(self):
         hits = [self._hit("c1", 0.5)]
@@ -305,6 +356,27 @@ class TestGraphEngine(unittest.TestCase):
         snapshot = saver.get("t1")
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot["state"]["x"], 1)
+
+    def test_file_checkpointer_is_bounded_and_flushes(self):
+        tmp = make_tmp()
+        try:
+            path = tmp / "ckpt.json"
+            saver = FileCheckpointer(path, max_threads=3)
+            graph = StateGraph()
+            graph.add_node("a", lambda s: {"x": 1})
+            graph.set_entry_point("a")
+            graph.add_edge("a", END)
+            compiled = graph.compile(checkpointer=saver)
+            for i in range(6):
+                compiled.invoke({"n": i}, thread_id=f"t{i}")
+            self.assertEqual(len(saver.list()), 3)
+            self.assertIn("t5", saver.list())
+            self.assertNotIn("t0", saver.list())
+            self.assertTrue(path.exists())
+            reloaded = FileCheckpointer(path, max_threads=3)
+            self.assertEqual(len(reloaded.list()), 3)
+        finally:
+            clean_tmp(tmp)
 
     def test_stream_emits_ordered_events(self):
         graph = StateGraph()

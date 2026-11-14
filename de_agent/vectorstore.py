@@ -12,11 +12,9 @@ import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import numpy as np
-
-from .textutil import tokenize
 
 
 @dataclass

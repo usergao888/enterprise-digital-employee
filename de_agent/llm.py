@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Protocol
 
 from .config import Settings
-from .textutil import keyword_overlap, split_sentences
+from .textutil import decompose_question, keyword_overlap, split_sentences
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +385,15 @@ class FakeLLM:
         match = re.search(r'"rewritten_query"\s*:\s*"([^"]{1,300})"', cls._system_text(messages))
         return match.group(1) if match else None
 
+    @classmethod
+    def _planned_sub_queries(cls, messages: list[Message]) -> list[str]:
+        match = re.search(
+            r'"sub_queries"\s*:\s*\[(.*?)\]', cls._system_text(messages), flags=re.S
+        )
+        if not match:
+            return []
+        return re.findall(r'"([^"]{1,120})"', match.group(1))[:5]
+
     @staticmethod
     def _tool_results(messages: list[Message]) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
@@ -469,6 +478,9 @@ class FakeLLM:
             "steps": steps,
             "need_knowledge": intent == "kb",
             "rewritten_query": re.sub(r"\s+", " ", question).strip()[:300],
+            "sub_queries": (
+                decompose_question(question, max_parts=3) if intent == "kb" else []
+            ),
         }
         return self._completion(json.dumps(plan, ensure_ascii=False), "plan")
 
@@ -491,7 +503,9 @@ class FakeLLM:
         if not results:
             planned_tool = INTENT_TOOL.get(intent, "")
             if planned_tool and planned_tool in available:
-                arguments = self._fake_arguments(planned_tool, query, intent)
+                arguments = self._fake_arguments(
+                    planned_tool, query, intent, self._planned_sub_queries(messages)
+                )
                 call = ToolCall(
                     id=f"call_{planned_tool}_1",
                     name=planned_tool,
@@ -505,7 +519,9 @@ class FakeLLM:
 
         return self._compose(question, results, intent)
 
-    def _fake_arguments(self, tool: str, question: str, intent: str) -> dict[str, Any]:
+    def _fake_arguments(
+        self, tool: str, question: str, intent: str, sub_queries: list[str] | None = None
+    ) -> dict[str, Any]:
         numbers = re.findall(r"\d+(?:\.\d+)?", question)
         if tool == "sql_query":
             if re.search(r"员工|人数|headcount|工号", question):
@@ -552,7 +568,7 @@ class FakeLLM:
             return {"employee_id": match.group(0) if match else "E1001"}
         if tool == "current_time":
             return {"utc_offset_hours": 8}
-        return {"query": question, "top_k": 5}
+        return {"query": question, "sub_queries": list(sub_queries or []), "top_k": 5}
 
     @staticmethod
     def _render_rows(payload: dict[str, Any]) -> str:

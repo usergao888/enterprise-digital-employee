@@ -27,15 +27,10 @@ from typing import Any, Iterator
 
 from .config import Settings
 from .embeddings import build_embedder
-from .graph import END, START, FileCheckpointer, MemoryCheckpointer, StateGraph
+from .graph import END, FileCheckpointer, StateGraph
 from .llm import FakeLLM, Message, MeteredRouter, OpenAICompatClient
-from .rag import (
-    HybridRetriever,
-    citation_report,
-    hits_to_sources,
-    pack_context,
-)
-from .tools import ToolRegistry, build_registry, ToolResult
+from .rag import HybridRetriever, citation_report
+from .tools import build_registry, ToolResult
 from .vectorstore import Chunk, Hit, MemoryVectorStore, build_store
 
 # ---------------------------------------------------------------------------
@@ -44,12 +39,14 @@ from .vectorstore import Chunk, Hit, MemoryVectorStore, build_store
 PLANNER_PROMPT = """你是企业数字员工的"规划智能体"。你的任务是把用户问题拆解成可执行步骤。
 可用工具：{tools}
 只输出 JSON，不要输出任何解释，格式：
-{{"intent": "kb|sql|calc|ticket|chat", "steps": ["..."], "need_knowledge": true, "rewritten_query": "..."}}
+{{"intent": "kb|sql|calc|ticket|chat", "steps": ["..."], "need_knowledge": true, "rewritten_query": "...", "sub_queries": ["..."]}}
 规则：
 1. 涉及公司制度、流程、政策的问题 intent 必须是 kb，need_knowledge=true。
 2. 涉及统计数字、金额、排名的问题 intent=sql。
 3. 需要精确算术时必须 intent=calc，不要心算。
-4. rewritten_query 要补全指代、保留关键实体，用于检索。"""
+4. rewritten_query 要补全指代、保留关键实体，用于检索。
+5. 若问题包含两个及以上可独立检索的子问题（如"年假有几天，怎么申请"），
+   拆成 2-3 条 sub_queries，每条都能单独拿去检索；单一问题给空数组 []。"""
 
 EXECUTOR_PROMPT = """你是企业数字员工，为员工提供准确的内部事务答复。
 
@@ -224,7 +221,9 @@ class DigitalEmployee:
 
         self.retriever = HybridRetriever(self.store, self.embedder, self.settings)
         self.registry = build_registry(
-            self.retriever, ticket_path=self.settings.index_dir / "tickets.json"
+            self.retriever,
+            ticket_path=self.settings.index_dir / "tickets.json",
+            settings=self.settings,
         )
 
         client = (
@@ -235,6 +234,9 @@ class DigitalEmployee:
         self.router = MeteredRouter(client, self.settings)
         self.memory = ConversationMemory()
         self.checkpointer = FileCheckpointer(self.settings.index_dir / "checkpoints.json")
+        # Lazily built by langgraph_adapter.build_langgraph_agent(); stays None
+        # unless the optional `langgraph` package is installed and used.
+        self.langgraph_app: Any = None
         self.graph = self._build_graph()
 
     # -- graph nodes ---------------------------------------------------
@@ -269,15 +271,19 @@ class DigitalEmployee:
             "steps": ["检索企业知识库", "整合答案"],
             "need_knowledge": True,
             "rewritten_query": state["question_safe"],
+            "sub_queries": [],
         }
         plan.setdefault("rewritten_query", state["question_safe"])
+        plan.setdefault("sub_queries", [])
+        if not isinstance(plan.get("sub_queries"), list):
+            plan["sub_queries"] = []
         return {"plan": plan, "plan_raw": completion.text[:400]}
 
     def node_execute(self, state: dict[str, Any]) -> dict[str, Any]:
         plan = state.get("plan") or {}
         messages: list[Message] = [
             Message.system(
-                EXECUTOR_PROMPT.format(plan=json.dumps(plan, ensure_ascii=False)[:500])
+                EXECUTOR_PROMPT.format(plan=json.dumps(plan, ensure_ascii=False)[:900])
             ),
             *self.memory.as_messages(),
             Message.user(state["question_safe"]),
@@ -294,6 +300,8 @@ class DigitalEmployee:
         tool_results: list[ToolResult] = []
         sources: list[dict[str, Any]] = []
         hits: list[Hit] = []
+        retrieval: dict[str, Any] = {}
+        pending_actions: list[dict[str, Any]] = []
         iterations = 0
         draft = ""
 
@@ -314,12 +322,22 @@ class DigitalEmployee:
                 result = self.registry.call(call.name, call.arguments)
                 tool_results.append(result)
                 messages.append(Message.tool(call.id, call.name, result.content))
+                if result.pending_action_id:
+                    action = self.registry.pending.get(result.pending_action_id)
+                    if action is not None:
+                        pending_actions.append(action.as_dict())
+                    continue
                 if call.name == "knowledge_search" and result.ok:
                     try:
                         payload = json.loads(result.content)
                     except json.JSONDecodeError:
                         continue
                     sources = payload.get("sources", sources)
+                    retrieval = {
+                        "queries": payload.get("queries", []),
+                        "decomposed": payload.get("decomposed", False),
+                        "decomposed_by": payload.get("decomposed_by", "none"),
+                    }
                     hits = [
                         Hit(
                             chunk=Chunk(
@@ -333,6 +351,15 @@ class DigitalEmployee:
                         )
                         for item in payload.get("sources", [])
                     ]
+
+            if pending_actions:
+                first = pending_actions[0]
+                draft = (
+                    f"这个动作会修改数据，我已生成待确认任务 {first['action_id']}"
+                    f"（工具 {first['tool']}）。**确认之后才会真正执行**，"
+                    "请回复确认，或调用 confirm 接口传入 action_id。"
+                )
+                break
         else:
             draft = "抱歉，工具调用轮次达到上限仍未完成，请补充更具体的信息。"
 
@@ -344,6 +371,8 @@ class DigitalEmployee:
             ],
             "sources": sources,
             "hits": hits,
+            "retrieval": retrieval,
+            "pending_actions": pending_actions,
             "iterations": iterations,
         }
 
@@ -474,6 +503,20 @@ class DigitalEmployee:
         return answer.rstrip() + "\n\n出处：\n" + "\n".join(lines)
 
     # -- public API ----------------------------------------------------
+    def confirm(self, action_id: str) -> dict[str, Any]:
+        """Execute a parked mutating action (the `interrupt()` resume half)."""
+        result = self.registry.confirm(action_id)
+        return {
+            "action_id": action_id,
+            "tool": result.name,
+            "ok": result.ok,
+            "result": result.content,
+            "error": result.error,
+        }
+
+    def cancel(self, action_id: str) -> dict[str, Any]:
+        return self.registry.cancel(action_id)
+
     def ingest(self, kb_dir: Path | None = None) -> dict[str, Any]:
         report = self.retriever.index_documents(kb_dir)
         if isinstance(self.store, MemoryVectorStore):
@@ -505,6 +548,8 @@ class DigitalEmployee:
             "question": question,
             "answer": final_state.get("final_answer", ""),
             "sources": final_state.get("sources", []),
+            "retrieval": final_state.get("retrieval", {}),
+            "pending_actions": final_state.get("pending_actions", []),
             "citations": citations,
             "self_check": self_check,
             "plan": final_state.get("plan", {}),

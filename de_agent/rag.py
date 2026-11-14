@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .config import Settings
-from .embeddings import Embedder, build_embedder
+from .embeddings import Embedder
 from .textutil import (
     coverage,
     keyword_overlap,
@@ -31,7 +31,7 @@ from .textutil import (
     split_sentences,
     tokenize,
 )
-from .vectorstore import Chunk, Hit, VectorStore, build_store
+from .vectorstore import Chunk, Hit, VectorStore
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 _MD_NOISE = re.compile(r"(`{3}.*?`{3})", re.DOTALL)
@@ -109,6 +109,15 @@ def chunk_document(
     doc_id: str, title: str, text: str, *, size: int, overlap: int, source_path: str = ""
 ) -> list[Chunk]:
     sections = _split_sections(text) or [("", text)]
+    # A document's preamble ("本流程描述…由人力资源部负责执行。") is 30-60 chars of
+    # pure throat-clearing. Left alone it becomes a standalone chunk that ranks
+    # #1 for "入职要带什么材料" while containing no answer at all. Merge it into
+    # the first real section instead.
+    if len(sections) > 1 and len(sections[0][1]) < 90:
+        preamble = sections[0][1]
+        heading, body = sections[1]
+        sections = [(heading, f"{preamble}\n{body}")] + sections[2:]
+
     chunks: list[Chunk] = []
     ordinal = 0
     for heading, body in sections:
@@ -234,14 +243,27 @@ class BM25Index:
 # fusion + rerank
 # ---------------------------------------------------------------------------
 def reciprocal_rank_fusion(
-    rankings: Iterable[Sequence[Hit]], k: int = 60, limit: int = 20
+    rankings: Iterable[Sequence[Hit]],
+    k: int = 60,
+    limit: int = 20,
+    weights: Sequence[float] | None = None,
 ) -> list[Hit]:
+    """Weighted RRF: `score(d) = Σ w_i / (k + rank_i(d))`.
+
+    The weight matters for multi-query retrieval. Treating the user's original
+    question and a 4-character sub-query as equal voters dilutes the main query
+    by 1/3 and can shuffle a correct top-1 down to rank 2 — which measurably
+    happened here before weights were introduced.
+    """
+    rankings = list(rankings)
+    if weights is None:
+        weights = [1.0] * len(rankings)
     scores: dict[str, float] = {}
     store: dict[str, Hit] = {}
-    for ranking in rankings:
+    for weight, ranking in zip(weights, rankings):
         for rank, hit in enumerate(ranking, start=1):
             cid = hit.chunk.chunk_id
-            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+            scores[cid] = scores.get(cid, 0.0) + weight / (k + rank)
             store.setdefault(cid, hit)
     ordered = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:limit]
     return [
@@ -308,6 +330,7 @@ class RetrievalResult:
     timings_ms: dict[str, float] = field(default_factory=dict)
     dense_candidates: int = 0
     sparse_candidates: int = 0
+    queries: list[str] = field(default_factory=list)
 
 
 class HybridRetriever:
@@ -386,6 +409,66 @@ class HybridRetriever:
             timings_ms=timings,
             dense_candidates=len(dense_hits),
             sparse_candidates=len(sparse_hits),
+            queries=[query],
+        )
+
+    def search_multi(self, queries: Sequence[str], k: int | None = None) -> RetrievalResult:
+        """Multi-query retrieval: retrieve per sub-query, fuse, rerank on the original.
+
+        Fusing at the *candidate* level (2N ranked lists into one RRF) rather than
+        concatenating results keeps a noisy sub-query from crowding out the main
+        one — RRF only rewards a chunk that several queries agree on.
+        """
+        k = k or self.settings.top_k_final
+        cleaned: list[str] = []
+        for query in queries:
+            normalised = normalize(query)
+            if normalised and normalised not in cleaned:
+                cleaned.append(normalised)
+        if not cleaned:
+            return RetrievalResult(query="", hits=[], queries=[])
+        if len(cleaned) == 1:
+            return self.search(cleaned[0], k=k)
+
+        timings: dict[str, float] = {}
+        rankings: list[Sequence[Hit]] = []
+        weights: list[float] = []
+        dense_count = 0
+        sparse_count = 0
+        t0 = time.perf_counter()
+        for position, query in enumerate(cleaned):
+            vector = self.embedder.embed([query])[0]
+            dense_hits = self.store.search(vector, self.settings.top_k_dense)
+            sparse_hits = self.bm25.search(query, self.settings.top_k_sparse)
+            dense_count += len(dense_hits)
+            sparse_count += len(sparse_hits)
+            rankings.append(dense_hits)
+            rankings.append(sparse_hits)
+            # The original question is the primary voter; sub-queries widen
+            # recall but must not redefine relevance.
+            weight = 1.0 if position == 0 else self.settings.sub_query_weight
+            weights.extend([weight, weight])
+        timings["multi_recall_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        t0 = time.perf_counter()
+        fused = reciprocal_rank_fusion(
+            rankings, k=self.settings.rrf_k, limit=max(k * 4, 20), weights=weights
+        )
+        # Always rerank against the user's original question — sub-queries exist
+        # to widen recall, not to redefine what "relevant" means.
+        if self.reranker is not None:
+            final = self.reranker.rerank(cleaned[0], fused, k)  # type: ignore[attr-defined]
+        else:
+            final = fused[:k]
+        timings["fuse_rerank_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        return RetrievalResult(
+            query=cleaned[0],
+            hits=final,
+            timings_ms=timings,
+            dense_candidates=dense_count,
+            sparse_candidates=sparse_count,
+            queries=cleaned,
         )
 
     def stats(self) -> dict[str, object]:
