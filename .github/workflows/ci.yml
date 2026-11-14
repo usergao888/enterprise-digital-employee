@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 项目唯一硬依赖就是 numpy，其余全部标准库 —— 所以 CI 不用装任何重型包
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip numpy
+
+      - name: Run unit + integration tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Run offline evaluation
+        run: python -m de_agent eval
+
+      - name: Upload evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-py${{ matrix.python-version }}
+          path: var/index/eval_report.md

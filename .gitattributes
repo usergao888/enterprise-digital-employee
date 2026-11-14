@@ -1,0 +1,12 @@
+# 统一换行符，避免 Windows 上提交出满屏 CRLF 的 diff
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+*.txt  text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.docx binary

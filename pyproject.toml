@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "de-agent"
+version = "0.3.1"
+description = "企业数字员工 AI Agent：LangGraph 风格状态图 + 混合检索 RAG + Tool Calling + 多模型路由"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "高亦程" }]
+keywords = ["ai-agent", "rag", "tool-calling", "langgraph", "vector-database", "llm"]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+langgraph = ["langgraph>=0.2.28"]
+vector = ["chromadb>=0.5", "qdrant-client>=1.9"]
+rerank = ["sentence-transformers>=3.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+de-agent = "de_agent.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-name/enterprise-digital-employee"
+
+[tool.setuptools.packages.find]
+include = ["de_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

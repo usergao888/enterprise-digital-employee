@@ -1,0 +1,28 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+
+# ---- 运行产物（可随时重新生成，不入库）----
+var/
+*.log
+
+# ---- 本地配置与密钥（绝对不要提交）----
+.env
+.env.local
+.env.*.local
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

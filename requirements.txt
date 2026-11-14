@@ -1,0 +1,18 @@
+# 核心运行只需要 numpy（向量运算），其余全部为标准库。
+# 这样任何一台没有 GPU、没有外网、没有 API Key 的机器都能跑起来做 demo 与测试。
+numpy>=1.26
+
+# ---- 可选：接入真实能力时再安装 ----------------------------------------
+# 真·LangGraph 运行时（de_agent/langgraph_adapter.py）
+# langgraph>=0.2.28
+#
+# 生产级向量库（DE_VECTOR_STORE=chroma / qdrant）
+# chromadb>=0.5
+# qdrant-client>=1.9
+#
+# 语义 embedding / 交叉编码器重排
+# sentence-transformers>=3.0
+#
+# 更快的 HTTP 服务（当前自带 stdlib http.server，已可跑）
+# fastapi>=0.115
+# uvicorn>=0.30
