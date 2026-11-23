@@ -18,6 +18,7 @@ import sys
 from .agents import DigitalEmployee, build_digital_employee
 from .config import Settings
 from .evaluation import run_evaluation
+from .task_eval import run_task_eval
 
 
 def _print_result(result: dict, *, show_trace: bool = False) -> None:
@@ -26,6 +27,8 @@ def _print_result(result: dict, *, show_trace: bool = False) -> None:
     plan = result.get("plan") or {}
     if plan:
         print(f"规划：intent={plan.get('intent')} steps={' > '.join(plan.get('steps', []))}")
+    if result.get("skills"):
+        print("技能：", ", ".join(result["skills"]))
     tools = result.get("tool_trace") or []
     if tools:
         called = ", ".join(f"{t['name']}({'ok' if t['ok'] else 'fail'})" for t in tools)
@@ -49,7 +52,7 @@ def _print_result(result: dict, *, show_trace: bool = False) -> None:
     print("-" * 72)
     print(
         f"延迟 {result['latency_ms']} ms | 模型调用 {usage.get('calls', 0)} 次 | "
-        f"成本 ¥{usage.get('total_cost_cny', 0):.6f} "
+        f"成本 {usage.get('total_cost_cny', 0):.6f} 元 "
         f"(较单模型省 {usage.get('saving_rate', 0):.1%})"
     )
     if show_trace:
@@ -120,18 +123,36 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     agent = build_digital_employee()
-    report = run_evaluation(agent, agent.settings.index_dir)
+    report = run_evaluation(
+        agent,
+        agent.settings.index_dir,
+        limit=args.limit,
+        progress=args.progress,
+        include_ablation=not args.skip_ablation,
+    )
     if args.json:
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        print(f"报告已写入 {agent.settings.index_dir / 'eval_report.md'}", file=sys.stderr)
     else:
         print(report["markdown"])
-    print(f"\n报告已写入 {agent.settings.index_dir / 'eval_report.md'}")
+        print(f"\n报告已写入 {agent.settings.index_dir / 'eval_report.md'}")
     return 0
 
 
 def cmd_graph(args: argparse.Namespace) -> int:
     agent = build_digital_employee()
-    print(json.dumps(agent.stats()["graph"], ensure_ascii=False, indent=2))
+    stats = agent.stats()
+    print(
+        json.dumps(
+            {
+                "runtime": stats["runtime"],
+                "langgraph": stats["langgraph"],
+                "graph": stats["graph"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -159,6 +180,26 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_taskeval(args: argparse.Namespace) -> int:
+    agent = build_digital_employee()
+    report = run_task_eval(
+        agent,
+        agent.settings.index_dir,
+        limit=args.limit,
+        progress=args.progress,
+    )
+    if args.json:
+        print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        print(
+            f"报告已写入 {agent.settings.index_dir / 'task_eval_report.md'}",
+            file=sys.stderr,
+        )
+    else:
+        print(report["markdown"])
+        print(f"\n报告已写入 {agent.settings.index_dir / 'task_eval_report.md'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="de_agent", description="企业数字员工 AI Agent（Python + RAG + Tool Calling）"
@@ -178,6 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ev = sub.add_parser("eval", help="离线评测")
     ev.add_argument("--json", action="store_true", help="只输出 JSON 摘要")
+    ev.add_argument("--limit", type=int, default=0, help="只跑前 N 条")
+    ev.add_argument("--progress", action="store_true", help="逐条打印进度到 stderr")
+    ev.add_argument("--skip-ablation", action="store_true", help="跳过消融实验")
+
+    tev = sub.add_parser("taskeval", help="30 条任务级评测 + badcase 归因")
+    tev.add_argument("--json", action="store_true", help="只输出 JSON 摘要")
+    tev.add_argument("--limit", type=int, default=0, help="只跑前 N 条")
+    tev.add_argument("--progress", action="store_true", help="逐条打印进度到 stderr")
 
     sub.add_parser("graph", help="打印图结构")
 
@@ -190,6 +239,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles are often GBK; the report contains ✅ / ¥ / emoji.
+    # Replace unencodable glyphs instead of crashing the whole command.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = {
@@ -197,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
         "ask": cmd_ask,
         "chat": cmd_chat,
         "eval": cmd_eval,
+        "taskeval": cmd_taskeval,
         "graph": cmd_graph,
         "serve": cmd_serve,
         "demo": cmd_demo,

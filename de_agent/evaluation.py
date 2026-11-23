@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -300,10 +301,23 @@ def retrieval_ablation(agent: Any, k: int = 5) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # end-to-end
 # ---------------------------------------------------------------------------
-def evaluate_agent(agent: Any, *, fresh_memory: bool = True) -> dict[str, Any]:
+def evaluate_agent(
+    agent: Any,
+    *,
+    fresh_memory: bool = True,
+    limit: int | None = None,
+    progress: bool = False,
+) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     started = time.perf_counter()
-    for case in GOLDEN:
+    cases = GOLDEN[:limit] if limit and limit > 0 else GOLDEN
+    for index, case in enumerate(cases, start=1):
+        if progress:
+            print(
+                f"[eval] {index}/{len(cases)} {case.question}",
+                file=sys.stderr,
+                flush=True,
+            )
         t0 = time.perf_counter()
         result = agent.ask(case.question, fresh_memory=fresh_memory)
         latency = (time.perf_counter() - t0) * 1000
@@ -441,7 +455,7 @@ def render_markdown(
     )
     lines.append(f"| P50 / P95 延迟 | {s['latency_p50_ms']} / {s['latency_p95_ms']} ms | 端到端（离线后端） |")
     lines.append(
-        f"| 多模型路由成本 | ¥{s['total_cost_cny']:.6f} vs 单模型 ¥{s['single_model_baseline_cny']:.6f}"
+        f"| 多模型路由成本 | CNY {s['total_cost_cny']:.6f} vs 单模型 CNY {s['single_model_baseline_cny']:.6f}"
         f"（省 {s['cost_saving_rate']:.1%}） | 全量走大模型的基线对比 |"
     )
     lines.append("")
@@ -511,10 +525,17 @@ def render_markdown(
     return "\n".join(lines)
 
 
-def run_evaluation(agent: Any, out_dir: Path) -> dict[str, Any]:
-    report = evaluate_agent(agent)
-    ablation = retrieval_ablation(agent)
-    decomp = decomposition_ablation(agent)
+def run_evaluation(
+    agent: Any,
+    out_dir: Path,
+    *,
+    limit: int | None = None,
+    progress: bool = False,
+    include_ablation: bool = True,
+) -> dict[str, Any]:
+    report = evaluate_agent(agent, limit=limit, progress=progress)
+    ablation = retrieval_ablation(agent) if include_ablation else []
+    decomp = decomposition_ablation(agent) if include_ablation else {}
     markdown = render_markdown(report, ablation, decomp)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "eval_report.md").write_text(markdown, encoding="utf-8")

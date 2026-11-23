@@ -1,0 +1,4 @@
+# Optional: MCP server dependency
+# Install into the repo-local .venv:
+#   python -m pip install -r scripts/requirements-mcp.txt
+mcp>=1.0

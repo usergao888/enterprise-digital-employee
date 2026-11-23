@@ -1,0 +1,6 @@
+# Phase 0 bootstrap dependencies: real LangGraph runtime + project runtime deps.
+# Install into the repo-local .venv:
+#   python -m pip install -r scripts/requirements-langgraph.txt
+numpy>=1.26
+langgraph>=0.2.40
+langgraph-checkpoint-sqlite>=2.0

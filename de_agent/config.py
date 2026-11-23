@@ -14,6 +14,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_KB_DIR = PROJECT_ROOT / "data" / "kb"
 DEFAULT_INDEX_DIR = PROJECT_ROOT / "var" / "index"
+DEFAULT_SKILLS_DIR = PROJECT_ROOT / "skills"
 
 # Illustrative CNY per 1k tokens (public list prices, rounded). Used only for
 # the routing cost report — never for billing.
@@ -61,6 +62,34 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def load_env_file(path: Path | None = None) -> None:
+    """Load a gitignored .env into os.environ (existing env always wins).
+
+    This is deliberately tiny: KEY=VALUE lines, optional `export `, quotes
+    stripped, comments/blank lines skipped. Values are never printed.
+    """
+    env_path = Path(path) if path is not None else Path(
+        os.environ.get("DE_ENV_FILE", str(PROJECT_ROOT / ".env"))
+    )
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 @dataclass
 class ModelSpec:
     """One concrete model endpoint used by the multi-model router."""
@@ -76,7 +105,7 @@ class Settings:
     # ---- LLM -------------------------------------------------------------
     llm_backend: str = "fake"            # fake | openai_compat
     llm_base_url: str = "https://api.deepseek.com/v1"
-    llm_api_key: str = ""
+    llm_api_key: str = field(default="", repr=False)
     llm_model: str = "deepseek-reasoner"
     llm_temperature: float = 0.2
     llm_timeout_s: int = 60
@@ -117,10 +146,28 @@ class Settings:
     enable_reviewer: bool = True
     # Park mutating tool calls for human confirmation instead of executing them.
     require_confirmation: bool = False
+    # auto = real LangGraph when installed, otherwise the bundled graph.py.
+    # custom = always use graph.py; langgraph = require the real runtime.
+    graph_runtime: str = "auto"
+    # read_only = deny mutating tools; ask = park them; auto = demo behaviour.
+    permission_mode: str = "auto"
+    # Skills are procedural knowledge (skills/<name>/SKILL.md), distinct from
+    # atomic tools. Metadata is always injected; body only on selection.
+    enable_skills: bool = True
+
+    # ---- Context budget --------------------------------------------------
+    enable_context_budget: bool = True
+    context_total_tokens: int = 6000
+    tool_output_max_chars: int = 4000
+    scratchpad_max_chars: int = 4000
+
+    # ---- Observability ---------------------------------------------------
+    enable_tracing: bool = True
 
     # ---- Paths -----------------------------------------------------------
     kb_dir: Path = field(default_factory=lambda: DEFAULT_KB_DIR)
     index_dir: Path = field(default_factory=lambda: DEFAULT_INDEX_DIR)
+    skills_dir: Path = field(default_factory=lambda: DEFAULT_SKILLS_DIR)
 
     # ---- Server ----------------------------------------------------------
     host: str = "127.0.0.1"
@@ -129,6 +176,7 @@ class Settings:
     # ------------------------------------------------------------------
     @classmethod
     def from_env(cls) -> "Settings":
+        load_env_file()
         settings = cls(
             llm_backend=_env("DE_LLM_BACKEND", "fake"),
             llm_base_url=_env("DE_LLM_BASE_URL", "https://api.deepseek.com/v1"),
@@ -159,8 +207,17 @@ class Settings:
             recursion_limit=_env_int("DE_RECURSION_LIMIT", 40),
             enable_reviewer=_env_bool("DE_ENABLE_REVIEWER", True),
             require_confirmation=_env_bool("DE_REQUIRE_CONFIRMATION", False),
+            graph_runtime=_env("DE_GRAPH_RUNTIME", "auto").lower(),
+            permission_mode=_env("DE_PERMISSION_MODE", "auto").lower(),
+            enable_skills=_env_bool("DE_ENABLE_SKILLS", True),
+            enable_context_budget=_env_bool("DE_ENABLE_CONTEXT_BUDGET", True),
+            context_total_tokens=_env_int("DE_CONTEXT_TOTAL_TOKENS", 6000),
+            tool_output_max_chars=_env_int("DE_TOOL_OUTPUT_MAX_CHARS", 4000),
+            scratchpad_max_chars=_env_int("DE_SCRATCHPAD_MAX_CHARS", 4000),
+            enable_tracing=_env_bool("DE_ENABLE_TRACING", True),
             kb_dir=Path(_env("DE_KB_DIR", str(DEFAULT_KB_DIR))).resolve(),
             index_dir=Path(_env("DE_INDEX_DIR", str(DEFAULT_INDEX_DIR))).resolve(),
+            skills_dir=Path(_env("DE_SKILLS_DIR", str(DEFAULT_SKILLS_DIR))).resolve(),
             host=_env("DE_HOST", "127.0.0.1"),
             port=_env_int("DE_PORT", 8710),
         )

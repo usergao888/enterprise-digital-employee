@@ -17,8 +17,8 @@ var/
 
 # ---- 本地配置与密钥（绝对不要提交）----
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # ---- 编辑器 / 系统 ----
 .vscode/

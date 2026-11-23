@@ -21,16 +21,20 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 from .config import Settings
+from .context import ContextManager
 from .embeddings import build_embedder
 from .graph import END, FileCheckpointer, StateGraph
 from .llm import FakeLLM, Message, MeteredRouter, OpenAICompatClient
 from .rag import HybridRetriever, citation_report
-from .tools import build_registry, ToolResult
+from .skills import SkillLibrary
+from .tools import PendingAction, build_registry, ToolResult
+from .tracing import TraceStore
 from .vectorstore import Chunk, Hit, MemoryVectorStore, build_store
 
 # ---------------------------------------------------------------------------
@@ -38,6 +42,8 @@ from .vectorstore import Chunk, Hit, MemoryVectorStore, build_store
 # ---------------------------------------------------------------------------
 PLANNER_PROMPT = """你是企业数字员工的"规划智能体"。你的任务是把用户问题拆解成可执行步骤。
 可用工具：{tools}
+可用技能（只按需参考，不代表必须使用）：
+{skills}
 只输出 JSON，不要输出任何解释，格式：
 {{"intent": "kb|sql|calc|ticket|chat", "steps": ["..."], "need_knowledge": true, "rewritten_query": "...", "sub_queries": ["..."]}}
 规则：
@@ -225,6 +231,23 @@ class DigitalEmployee:
             ticket_path=self.settings.index_dir / "tickets.json",
             settings=self.settings,
         )
+        # Skills are procedural knowledge; tools stay in the registry above.
+        self.skills = (
+            SkillLibrary(self.settings.skills_dir)
+            if self.settings.enable_skills
+            else None
+        )
+        self.context = ContextManager(
+            self.settings.index_dir,
+            total_tokens=self.settings.context_total_tokens,
+            tool_output_max_chars=self.settings.tool_output_max_chars,
+            scratchpad_max_chars=self.settings.scratchpad_max_chars,
+            enabled=self.settings.enable_context_budget,
+        )
+        self.tracer = TraceStore(
+            self.settings.index_dir / "traces",
+            enabled=self.settings.enable_tracing,
+        )
 
         client = (
             FakeLLM(self.settings)
@@ -234,10 +257,17 @@ class DigitalEmployee:
         self.router = MeteredRouter(client, self.settings)
         self.memory = ConversationMemory()
         self.checkpointer = FileCheckpointer(self.settings.index_dir / "checkpoints.json")
-        # Lazily built by langgraph_adapter.build_langgraph_agent(); stays None
-        # unless the optional `langgraph` package is installed and used.
-        self.langgraph_app: Any = None
+        self.runtime = self._resolve_runtime(self.settings.graph_runtime)
+        # The custom graph is always compiled: it is the fallback runtime and
+        # the source of `stats()["graph"]`.
         self.graph = self._build_graph()
+        # Real LangGraph runtime (only when selected and importable).
+        self.langgraph_app: Any = None
+        self._langgraph_conn: Any = None
+        self._pending_threads_path = self.settings.index_dir / "pending_threads.json"
+        self._pending_threads: dict[str, str] = self._load_pending_threads()
+        if self.runtime == "langgraph":
+            self.langgraph_app = self._build_langgraph()
 
     # -- graph nodes ---------------------------------------------------
     # Nodes are plain methods over the shared state dict rather than closures:
@@ -260,8 +290,19 @@ class DigitalEmployee:
             f"{name}({self.registry.tools[name].description.split('。')[0]})"
             for name in self.registry.names()
         )
+        skills_desc = (
+            self.skills.describe_for_prompt() if self.skills else "（未启用技能）"
+        )
+        skills_desc = self.context.fit(skills_desc, "skills")
+        selected = (
+            self.skills.select(state.get("question_safe", ""), limit=1)
+            if self.skills
+            else []
+        )
         messages = [
-            Message.system(PLANNER_PROMPT.format(tools=tools_desc)),
+            Message.system(
+                PLANNER_PROMPT.format(tools=tools_desc, skills=skills_desc)
+            ),
             *self.memory.as_messages(limit_chars=300),
             Message.user(state["question_safe"]),
         ]
@@ -277,17 +318,34 @@ class DigitalEmployee:
         plan.setdefault("sub_queries", [])
         if not isinstance(plan.get("sub_queries"), list):
             plan["sub_queries"] = []
-        return {"plan": plan, "plan_raw": completion.text[:400]}
+        return {
+            "plan": plan,
+            "plan_raw": completion.text[:400],
+            "skills": [skill.name for skill in selected],
+            "skill_instructions": (
+                self.skills.instructions_for(selected) if self.skills else ""
+            ),
+        }
 
     def node_execute(self, state: dict[str, Any]) -> dict[str, Any]:
         plan = state.get("plan") or {}
+        plan_text = self.context.fit(
+            json.dumps(plan, ensure_ascii=False), "system"
+        )
         messages: list[Message] = [
-            Message.system(
-                EXECUTOR_PROMPT.format(plan=json.dumps(plan, ensure_ascii=False)[:900])
-            ),
+            Message.system(EXECUTOR_PROMPT.format(plan=plan_text[:900])),
             *self.memory.as_messages(),
             Message.user(state["question_safe"]),
         ]
+        if state.get("skill_instructions"):
+            # Progressive disclosure step 2: body only for the selected skill.
+            messages.insert(
+                1,
+                Message.system(
+                    "适用技能说明：\n"
+                    + self.context.fit(str(state["skill_instructions"]), "skills")
+                ),
+            )
         if state.get("review", {}).get("fix_hint"):
             # Feedback is a developer/system note, not a new user turn;
             # otherwise it becomes "the question" for the next pass.
@@ -321,7 +379,13 @@ class DigitalEmployee:
             for call in assistant_message.tool_calls:
                 result = self.registry.call(call.name, call.arguments)
                 tool_results.append(result)
-                messages.append(Message.tool(call.id, call.name, result.content))
+                messages.append(
+                    Message.tool(
+                        call.id,
+                        call.name,
+                        self.context.prune_tool_output(result.content),
+                    )
+                )
                 if result.pending_action_id:
                     action = self.registry.pending.get(result.pending_action_id)
                     if action is not None:
@@ -370,7 +434,7 @@ class DigitalEmployee:
                 for r in tool_results
             ],
             "sources": sources,
-            "hits": hits,
+            "hits": [self._hit_dict(hit) for hit in hits],
             "retrieval": retrieval,
             "pending_actions": pending_actions,
             "iterations": iterations,
@@ -393,7 +457,7 @@ class DigitalEmployee:
 
         # Deterministic checks are authoritative for the things a model tends to
         # hand-wave: citation presence and citation validity.
-        report = citation_report(draft, state.get("hits") or [], question)
+        report = citation_report(draft, self._state_hits(state), question)
         issues = list(review.get("issues") or [])
         if intent == "kb" and report["cited"] == 0:
             issues.append("制度类问题缺少 [n] 引用")
@@ -413,7 +477,71 @@ class DigitalEmployee:
     def node_revise(self, state: dict[str, Any]) -> dict[str, Any]:
         return {"revisions": int(state.get("revisions", 0)) + 1}
 
+    def node_approval(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Pause a mutating tool call, then execute or discard it on resume.
+
+        ``interrupt()`` re-runs this node from the top when the graph resumes,
+        so nothing before the call may have a side effect.
+        """
+        from langgraph.types import interrupt
+
+        actions = state.get("pending_actions") or []
+        if not actions:
+            return {"approval": {"approved": False, "reason": "no_pending_action"}}
+        action = actions[0]
+        decision = interrupt(
+            {"action": action, "question": "该操作会修改数据，是否确认执行？"}
+        )
+        approved = (
+            bool(decision.get("approved"))
+            if isinstance(decision, dict)
+            else bool(decision)
+        )
+        trace = list(state.get("tool_trace") or [])
+        action_id = str(action.get("action_id") or "")
+        if not approved:
+            self.registry.cancel(action_id)
+            return {
+                "draft": f"已取消 `{action.get('tool', '')}`，未写入任何数据。",
+                "pending_actions": [],
+                "tool_trace": trace,
+                "approval": {
+                    "approved": False,
+                    "action_id": action_id,
+                    "tool": action.get("tool", ""),
+                },
+            }
+        result = self.registry.confirm(action_id)
+        trace.append(
+            {
+                "name": result.name,
+                "ok": result.ok,
+                "error": result.error,
+                "latency_ms": result.latency_ms,
+            }
+        )
+        return {
+            "draft": self._format_approval_result(action, result),
+            "pending_actions": [],
+            "tool_trace": trace,
+            "approval": {
+                "approved": True,
+                "action_id": action_id,
+                "tool": action.get("tool", ""),
+                "ok": result.ok,
+            },
+        }
+
     def node_finalize(self, state: dict[str, Any]) -> dict[str, Any]:
+        turn_key = state.get("turn_id")
+        if turn_key and state.get("finalized_turn") == turn_key:
+            # Resume/replay: the turn was already written to memory. Do not
+            # append it twice (and do not re-append the source list).
+            return {
+                "final_answer": state.get("final_answer", ""),
+                "citations": state.get("citations") or {},
+                "sources": state.get("sources") or [],
+            }
         answer = state.get("draft", "")
         if not (state.get("guard") or {}).get("allowed", True):
             answer = (
@@ -422,22 +550,28 @@ class DigitalEmployee:
                 + "），我不会执行。你可以换一种表述继续咨询内部事务。"
             )
         report = citation_report(
-            answer, state.get("hits") or [], state.get("question_safe", "")
+            answer, self._state_hits(state), state.get("question_safe", "")
         )
         sources = state.get("sources") or []
         answer = self._append_source_list(answer, sources)
         self.memory.add(state["question"], answer, sources)
         self.memory.compact(self.router)
-        return {
+        result = {
             "final_answer": answer,
             "citations": report,
             "sources": sources,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if turn_key:
+            result["finalized_turn"] = turn_key
+        return result
 
     # -- routing -------------------------------------------------------
     def route_after_guard(self, state: dict[str, Any]) -> str:
         return "continue" if (state.get("guard") or {}).get("allowed", True) else "blocked"
+
+    def route_after_execute(self, state: dict[str, Any]) -> str:
+        return "approval" if state.get("pending_actions") else "review"
 
     def route_after_review(self, state: dict[str, Any]) -> str:
         review = state.get("review") or {}
@@ -485,7 +619,164 @@ class DigitalEmployee:
             recursion_limit=self.settings.recursion_limit,
         )
 
+    # -- real LangGraph runtime ---------------------------------------
+    @staticmethod
+    def _resolve_runtime(requested: str) -> str:
+        requested = (requested or "auto").lower()
+        if requested not in {"auto", "custom", "langgraph"}:
+            raise ValueError(
+                f"DE_GRAPH_RUNTIME 只能是 auto/custom/langgraph，收到 {requested!r}"
+            )
+        if requested == "custom":
+            return "custom"
+        from .langgraph_adapter import langgraph_available
+
+        available = langgraph_available()
+        if requested == "langgraph" and not available:
+            raise RuntimeError(
+                "DE_GRAPH_RUNTIME=langgraph 但未安装 langgraph / "
+                "langgraph-checkpoint-sqlite；先运行 scripts/bootstrap-langgraph.ps1"
+            )
+        return "langgraph" if available else "custom"
+
+    def _build_langgraph(self) -> Any:
+        from .langgraph_adapter import build_langgraph_agent
+
+        return build_langgraph_agent(self)
+
+    def _ask_langgraph(self, question: str, thread_id: str, turn_id: str) -> dict[str, Any]:
+        from .langgraph_adapter import invoke_langgraph
+
+        state = invoke_langgraph(self, self.langgraph_app, question, thread_id, turn_id)
+        for action in state.get("pending_actions") or []:
+            action_id = str(action.get("action_id") or "")
+            if action_id:
+                self._remember_pending_thread(action_id, thread_id)
+        return state
+
+    def _resume_langgraph(self, thread_id: str, decision: dict[str, Any]) -> dict[str, Any]:
+        from .langgraph_adapter import resume_langgraph
+
+        # A restarted process no longer has the in-memory PendingAction; rebuild
+        # it from the checkpoint before the approval node calls registry.confirm.
+        self._restore_pending_action(thread_id)
+        return resume_langgraph(self, self.langgraph_app, thread_id, decision)
+
+    def _langgraph_values(self, thread_id: str) -> dict[str, Any]:
+        from .langgraph_adapter import get_langgraph_values
+
+        return get_langgraph_values(self, self.langgraph_app, thread_id)
+
+    def _restore_pending_action(self, thread_id: str) -> None:
+        state = self._langgraph_values(thread_id)
+        for item in state.get("pending_actions") or []:
+            action_id = str(item.get("action_id") or "")
+            if not action_id or action_id in self.registry.pending:
+                continue
+            self.registry.pending[action_id] = PendingAction(
+                action_id=action_id,
+                tool=str(item.get("tool") or ""),
+                arguments=dict(item.get("arguments") or {}),
+                created_at=time.time(),
+            )
+
+    def _load_pending_threads(self) -> dict[str, str]:
+        try:
+            data = json.loads(self._pending_threads_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+
+    def _remember_pending_thread(self, action_id: str, thread_id: str) -> None:
+        self._pending_threads[action_id] = thread_id
+        self._flush_pending_threads()
+
+    def _forget_pending_thread(self, action_id: str) -> None:
+        self._pending_threads.pop(action_id, None)
+        merged = self._load_pending_threads()
+        merged.pop(action_id, None)
+        self._pending_threads = merged
+        self._flush_pending_threads()
+
+    def _flush_pending_threads(self) -> None:
+        try:
+            self._pending_threads_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._pending_threads_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._pending_threads, ensure_ascii=False), encoding="utf-8"
+            )
+            tmp.replace(self._pending_threads_path)
+        except OSError:
+            pass
+
+    def _pending_thread_for(self, action_id: str) -> str | None:
+        return self._pending_threads.get(action_id) or self._load_pending_threads().get(
+            action_id
+        )
+
+    @staticmethod
+    def _format_approval_result(action: dict[str, Any], result: ToolResult) -> str:
+        if not result.ok:
+            return (
+                f"`{action.get('tool', '')}` 执行失败："
+                f"{result.error or result.content}"
+            )
+        try:
+            payload = json.loads(result.content)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            ticket = payload.get("ticket_id") or payload.get("id")
+            if ticket:
+                return f"已创建工单 {ticket}。"
+        return f"`{action.get('tool', '')}` 已执行：{str(result.content)[:500]}"
+
+    def resume(self, thread_id: str, *, approved: bool = True) -> dict[str, Any]:
+        """Resume an interrupted LangGraph thread (also works after restart)."""
+        if self.runtime != "langgraph":
+            raise RuntimeError("resume() 仅用于 langgraph 运行时")
+        state = self._resume_langgraph(thread_id, {"approved": approved})
+        return self._result(state.get("question", ""), state, 0.0, thread_id)
+
     # -- helpers -------------------------------------------------------
+    @staticmethod
+    def _hit_dict(hit: Hit) -> dict[str, Any]:
+        """Checkpoint-safe form of a Hit (LangGraph state must be serializable)."""
+        chunk = hit.chunk
+        return {
+            "chunk_id": chunk.chunk_id,
+            "doc_id": chunk.doc_id,
+            "title": chunk.title,
+            "heading": chunk.heading,
+            "text": chunk.text,
+            "score": hit.score,
+        }
+
+    @staticmethod
+    def _state_hits(state: dict[str, Any]) -> list[Hit]:
+        hits: list[Hit] = []
+        for item in state.get("hits") or []:
+            if isinstance(item, Hit):
+                hits.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            hits.append(
+                Hit(
+                    chunk=Chunk(
+                        chunk_id=str(item.get("chunk_id") or ""),
+                        doc_id=str(item.get("doc_id") or ""),
+                        title=str(item.get("title") or ""),
+                        heading=str(item.get("heading") or ""),
+                        text=str(item.get("text") or ""),
+                    ),
+                    score=float(item.get("score") or 0.0),
+                )
+            )
+        return hits
+
     @staticmethod
     def _append_source_list(answer: str, sources: list[dict[str, Any]]) -> str:
         if not sources:
@@ -505,6 +796,29 @@ class DigitalEmployee:
     # -- public API ----------------------------------------------------
     def confirm(self, action_id: str) -> dict[str, Any]:
         """Execute a parked mutating action (the `interrupt()` resume half)."""
+        if self.runtime == "langgraph":
+            thread_id = self._pending_thread_for(action_id)
+            if not thread_id:
+                return {
+                    "action_id": action_id,
+                    "tool": "",
+                    "ok": False,
+                    "result": "",
+                    "error": "unknown_action",
+                }
+            state = self._resume_langgraph(
+                thread_id, {"approved": True, "action_id": action_id}
+            )
+            self._forget_pending_thread(action_id)
+            approval = state.get("approval") or {}
+            ok = bool(approval.get("ok", False))
+            return {
+                "action_id": action_id,
+                "tool": approval.get("tool", ""),
+                "ok": ok,
+                "result": state.get("final_answer") or state.get("draft", ""),
+                "error": None if ok else "tool_failed",
+            }
         result = self.registry.confirm(action_id)
         return {
             "action_id": action_id,
@@ -515,6 +829,15 @@ class DigitalEmployee:
         }
 
     def cancel(self, action_id: str) -> dict[str, Any]:
+        if self.runtime == "langgraph":
+            thread_id = self._pending_thread_for(action_id)
+            if not thread_id:
+                return {"cancelled": False, "action_id": action_id}
+            self._resume_langgraph(
+                thread_id, {"approved": False, "action_id": action_id}
+            )
+            self._forget_pending_thread(action_id)
+            return {"cancelled": True, "action_id": action_id}
         return self.registry.cancel(action_id)
 
     def ingest(self, kb_dir: Path | None = None) -> dict[str, Any]:
@@ -529,38 +852,66 @@ class DigitalEmployee:
             self.memory = ConversationMemory()
         self.router.reset_usage()
         started = time.perf_counter()
-        final_state: dict[str, Any] = {}
-        for event in self.graph.stream({"question": question}, thread_id=thread_id):
-            if event["type"] == "end":
-                final_state = event["state"]
+        turn_id = uuid.uuid4().hex
+        thread_id = thread_id or f"thread-{uuid.uuid4().hex[:8]}"
+        if self.runtime == "langgraph":
+            final_state = self._ask_langgraph(question, thread_id, turn_id)
+        else:
+            final_state = {}
+            for event in self.graph.stream(
+                {"question": question, "turn_id": turn_id}, thread_id=thread_id
+            ):
+                if event["type"] == "end":
+                    final_state = event["state"]
         elapsed = round((time.perf_counter() - started) * 1000, 2)
+        result = self._result(question, final_state, elapsed, thread_id)
+        self.context.record_turn(
+            result.get("thread_id") or thread_id,
+            question,
+            result.get("answer", ""),
+            result.get("tool_trace") or [],
+        )
+        result["trace_id"] = self.tracer.record(
+            question=question,
+            result=result,
+            elapsed_ms=elapsed,
+            runtime=self.runtime,
+        )
+        return result
+
+    def _result(self, question: str, final_state: dict[str, Any],
+                elapsed_ms: float, thread_id: str | None = None) -> dict[str, Any]:
         citations = final_state.get("citations") or {}
+        answer = final_state.get("final_answer") or final_state.get("draft") or ""
         self_check = {
-            "has_answer": bool(final_state.get("final_answer")),
+            "has_answer": bool(answer),
             "cited": int(citations.get("cited", 0) or 0),
             "citation_valid": (
                 bool(citations.get("existing")) if citations.get("cited") else None
             ),
             "support_rate": citations.get("support_rate", 0.0),
-            "answer_chars": len(final_state.get("final_answer", "") or ""),
+            "answer_chars": len(answer),
         }
         return {
             "question": question,
-            "answer": final_state.get("final_answer", ""),
+            "answer": answer,
             "sources": final_state.get("sources", []),
             "retrieval": final_state.get("retrieval", {}),
             "pending_actions": final_state.get("pending_actions", []),
             "citations": citations,
             "self_check": self_check,
             "plan": final_state.get("plan", {}),
+            "skills": final_state.get("skills", []),
             "review": final_state.get("review", {}),
             "tool_trace": final_state.get("tool_trace", []),
             "revisions": final_state.get("revisions", 0),
             "trace": final_state.get("trace", []),
             "usage": self.router.usage_summary(),
-            "latency_ms": elapsed,
-            "thread_id": final_state.get("thread_id"),
+            "latency_ms": elapsed_ms,
+            "thread_id": final_state.get("thread_id") or thread_id,
             "guard": final_state.get("guard", {}),
+            "interrupted": bool(final_state.get("__next__")),
+            "runtime": self.runtime,
         }
 
     def stream_answer(self, question: str) -> Iterator[dict[str, Any]]:
@@ -579,6 +930,11 @@ class DigitalEmployee:
             "offline": self.offline,
             "llm_backend": self.settings.llm_backend,
             "embed_backend": self.settings.embed_backend,
+            "runtime": self.runtime,
+            "langgraph": bool(self.langgraph_app),
+            "skills": self.skills.names() if self.skills else [],
+            "context": self.context.stats(),
+            "tracing": self.tracer.stats(),
             "graph": self.graph.describe(),
         }
 

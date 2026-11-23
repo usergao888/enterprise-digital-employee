@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Settings
+from .permissions import PermissionDecision, PermissionPolicy
 from .rag import HybridRetriever, hits_to_sources
 from .textutil import decompose_question
 
@@ -145,6 +146,7 @@ class ToolRegistry:
     call_log: list[dict[str, Any]] = field(default_factory=list)
     confirm_mutating: bool = False
     pending: dict[str, PendingAction] = field(default_factory=dict)
+    policy: PermissionPolicy | None = None
 
     def register(self, tool: Tool) -> "ToolRegistry":
         self.tools[tool.name] = tool
@@ -240,7 +242,23 @@ class ToolRegistry:
                 ),
                 error="bad_arguments",
             )
-        if tool.mutating and self.confirm_mutating:
+        decision: PermissionDecision | None = (
+            self.policy.decide(name, tool.mutating) if self.policy else None
+        )
+        if decision is not None and not decision.allow:
+            return ToolResult(
+                name=name,
+                ok=False,
+                content=json.dumps(
+                    {"error": "权限策略拒绝", "reason": decision.reason},
+                    ensure_ascii=False,
+                ),
+                error="permission_denied",
+            )
+        if tool.mutating and (
+            self.confirm_mutating
+            or (decision is not None and decision.requires_confirmation)
+        ):
             return self._park(tool, arguments)
         return self._execute(tool, arguments)
 
@@ -370,7 +388,10 @@ def build_registry(
     db = db or _seed_employee_db()
     ticket_path.parent.mkdir(parents=True, exist_ok=True)
     settings = settings or Settings()
-    registry = ToolRegistry(confirm_mutating=settings.require_confirmation)
+    registry = ToolRegistry(
+        confirm_mutating=settings.require_confirmation,
+        policy=PermissionPolicy(settings.permission_mode),
+    )
 
     # -- knowledge search ---------------------------------------------
     def knowledge_search(

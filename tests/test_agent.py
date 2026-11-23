@@ -26,6 +26,7 @@ def make_agent(index_dir: Path) -> DigitalEmployee:
         index_dir=index_dir,
         enable_reviewer=True,
         max_revisions=1,
+        graph_runtime="custom",
     )
     agent = DigitalEmployee(settings)
     agent.ingest()
@@ -137,6 +138,7 @@ class TestHumanInTheLoop(unittest.TestCase):
             kb_dir=ROOT / "data" / "kb",
             index_dir=cls._tmp,
             require_confirmation=True,
+            graph_runtime="custom",
         )
         cls.agent = DigitalEmployee(settings)
         cls.agent.ingest()

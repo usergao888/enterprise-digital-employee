@@ -14,7 +14,8 @@ keywords = ["ai-agent", "rag", "tool-calling", "langgraph", "vector-database", "
 dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
-langgraph = ["langgraph>=0.2.28"]
+langgraph = ["langgraph>=0.2.40", "langgraph-checkpoint-sqlite>=2.0"]
+mcp = ["mcp>=1.0"]
 vector = ["chromadb>=0.5", "qdrant-client>=1.9"]
 rerank = ["sentence-transformers>=3.0"]
 dev = ["pytest>=8.0"]

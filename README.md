@@ -9,7 +9,7 @@
 这不是一个"调用 OpenAI 接口的 demo"。它把企业知识问答里真正会卡住的地方都做了一遍：中文分块、双路召回、角标可追溯、工具参数校验、写完操作的 SLA、审核不通过自动重写、以及**用代码跑出来的指标**而不是简历上拍的百分比。
 
 ```
-Python 3.10+ · numpy 是唯一硬依赖 · 70 个单元/集成测试 · 无需 GPU / 无需 API Key
+Python 3.10+ · numpy 是唯一硬依赖 · 112 个单元/集成测试 · 无需 GPU / 无需 API Key
 ```
 
 ---
@@ -78,8 +78,9 @@ python -m de_agent demo            # 跑一遍 8 个典型问题
 python -m de_agent ask "一线城市出差住宿每晚能报多少？" --trace
 python -m de_agent chat            # 多轮对话
 python -m de_agent eval            # 跑评测集，产出 var/index/eval_report.md
+python -m de_agent taskeval        # 30 条任务级评测 + badcase 归因
 python -m de_agent serve           # 打开 http://127.0.0.1:8710 有网页版
-python -m unittest discover -s tests -t .    # 70 个测试
+python -m unittest discover -s tests -t .    # 112 个测试
 ```
 
 接真实模型（默认是离线后端，不需要 Key）：
@@ -92,13 +93,71 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 # 换语义 embedding：DE_EMBED_BACKEND=openai_compat DE_EMBED_MODEL=text-embedding-v3
 ```
 
+### 真 LangGraph 运行时（Phase 0 已完成）
+
+默认 `DE_GRAPH_RUNTIME=auto`：装了 `langgraph` 就用真运行时（SQLite checkpoint + `interrupt` 人工确认），否则回退到 `de_agent/graph.py`。
+
+```powershell
+# 强制真运行时（需先跑一次 scripts/bootstrap-langgraph.cmd）
+$env:DE_GRAPH_RUNTIME='langgraph'
+python -m de_agent ask "一线城市出差住宿每晚能报多少？"
+
+# 强制自带引擎（零依赖，测试用）
+$env:DE_GRAPH_RUNTIME='custom'
+python -m de_agent ask "一线城市出差住宿每晚能报多少？"
+```
+
+- checkpoint：`var/index/langgraph_checkpoints.sqlite`
+- 写操作：`DE_REQUIRE_CONFIRMATION=true` 时，`create_ticket` 停在 `approval` 节点；CLI 输入 `y` 会 `Command(resume=...)` 继续
+- 环境准备：`.\scripts\bootstrap-langgraph.cmd`（进程级 Bypass，不改系统策略）
+- 迁移细节 / 实测版本：[docs/langgraph-migration.md](docs/langgraph-migration.md)
+
+### Agent Skills + MCP（Phase 1）
+
+- Skills：`skills/<name>/SKILL.md`；元数据常驻 planner，正文按命中加载。新增技能后跑 `python -m unittest tests.test_skills -v`。
+- MCP：`python -m de_agent.mcp_server`（需 `pip install mcp`），只暴露 `knowledge_search` / `sql_query` / `employee_profile`（内部 `get_employee_profile`），`create_ticket` 不暴露。
+- 仓库级指令：[AGENTS.md](AGENTS.md)；配置与验收：[docs/skills-and-mcp.md](docs/skills-and-mcp.md)。
+
+### Context Engineering + Agent Harness（Phase 2）
+
+- `de_agent/context.py`：分 section 的 token 预算、工具输出裁剪、per-thread scratchpad（`var/index/scratchpad/<thread>.md`）。
+- `de_agent/harness.py`：`AgentHarness` 驱动多步任务，写 `var/index/harness/<run>/state.json` 与 `progress.md`；预算是 `max_steps / max_cost_cny / max_tokens / max_wall_clock_s`，审批中断可 `resume`。
+- 示例与边界：[docs/context-harness.md](docs/context-harness.md)。
+
+### 任务级 Eval + Trace + 权限/Sandbox（Phase 3）
+
+- `python -m de_agent taskeval`：30 条任务，按 guard/tool/retrieval/citation/generation 归因；离线 FakeLLM 基线 20/30（66.7%），badcase 见 [docs/task_eval_report.md](docs/task_eval_report.md)。
+- `DE_ENABLE_TRACING=true`：每个 ask 写 `var/index/traces/<date>/<trace_id>.json`，结果里带 `trace_id`。
+- `DE_PERMISSION_MODE=read_only|ask|auto`；`de_agent/sandbox.py` 提供 Docker 硬化命令与本地 Python 降级执行。
+- MCP 2.x 已实跑（HTTP transport）：3 个只读工具；细节 [docs/phase3-eval-trace-safety.md](docs/phase3-eval-trace-safety.md)。
+
+### 真实模型重跑（待 Key）
+
+```powershell
+$env:DE_LLM_API_KEY = "sk-..."   # 只在本窗口生效，不要写进仓库
+.\scripts\run-real-eval.cmd -Limit 3   # 先跑前 3 条验证链路
+.\scripts\run-real-eval.cmd            # 全量：15 eval + 30 taskeval
+```
+
+也可以把新 Key 填进仓库根目录的 `.env`（已被 gitignore）：
+
+```dotenv
+DE_LLM_API_KEY=sk-新key
+```
+
+`Settings.from_env()` 会自动加载 `.env`，进程环境变量优先；runner 也会读它。
+
+默认 DeepSeek；Qwen / Ollama / vLLM 只换 `-BaseUrl` 与模型名。报告写到 `var/index/real/`，不覆盖离线报告。说明：[docs/real-model-rerun.md](docs/real-model-rerun.md)。
+
+> Key 安全：只从环境变量或 `.env`（gitignored）读；`.env.example` 只放占位符，`tests/test_secrets.py` 会拦住长 `sk-` 值。细节见文档第 8 节。
+
 ---
 
 ## 四、评测结果（`python -m de_agent eval` 实跑）
 
 15 条业务问题，覆盖制度问答 / 数据查询 / 工单 / 计算 / 安全拦截：
 
-> 完整报告（可复跑）：[docs/eval_report.md](docs/eval_report.md)
+> 完整报告（可复跑）：custom 引擎 [docs/eval_report.md](docs/eval_report.md)；真 LangGraph [docs/eval_report_langgraph.md](docs/eval_report_langgraph.md)
 
 | 指标 | 数值 |
 | --- | --- |
@@ -108,7 +167,7 @@ export DE_LLM_MODEL=deepseek-reasoner DE_SMALL_MODEL=deepseek-chat
 | 多文档覆盖率 | 100.0% |
 | 引用合规率（角标存在且可回溯） | 100.0% |
 | 答案关键信息命中 | 86.7% |
-| P50 / P95 延迟 | 7.1 / 9.9 ms（离线后端，仅反映编排+检索开销） |
+| P50 / P95 延迟 | custom 约 15 / 20 ms；LangGraph 约 16 / 24 ms（离线后端，仅反映编排+检索开销） |
 | 多模型路由成本 | ¥0.0833 vs 全量走大模型 ¥0.1917，**省 56.6%** |
 
 检索策略消融（18 条含精确数字/编号与改写类问题）：
@@ -167,7 +226,7 @@ Agent 最危险的不是答错，是**在没人同意的情况下把事办了**�
 
 | JD 要求 | 本工程证据 |
 | --- | --- |
-| **Python** | 全量 Python 3.10+，`de_agent/` 12 个模块，70 个测试 |
+| **Python** | 全量 Python 3.10+，`de_agent/` 21 个模块，112 个测试 |
 | **至少一种主流 Agent 框架（LangChain/LangGraph/Dify）** | `graph.py` 自研 LangGraph 同构引擎 + `langgraph_adapter.py` 可直接切真 LangGraph |
 | **RAG** | 结构化分块 → 双路召回 → 加权 RRF → 重排 → 引用溯源 → 消融实验（`rag.py`） |
 | **Tool Calling** | 6 个工具、标准 JSON Schema、参数校验、异常兜底、写操作标记 + **人工确认门**（`tools.py`） |
@@ -203,15 +262,24 @@ enterprise-agent/
 │   ├── vectorstore.py         # 内存向量库 + Chroma/Qdrant 适配器
 │   ├── rag.py                 # 分块 / BM25 / RRF / 重排 / 引用校验
 │   ├── tools.py               # 工具注册表 / JSON Schema 校验 / 6 个内置工具
+│   ├── context.py             # 上下文预算 / 工具输出裁剪 / scratchpad
+│   ├── skills.py              # SKILL.md 渐进加载
+│   ├── harness.py             # 多步任务 Harness（预算 / 续跑）
+│   ├── task_eval.py           # 30 条任务级评测 + badcase 归因
+│   ├── tracing.py             # 每个 ask 的 OTel 形状 JSON trace
+│   ├── permissions.py         # read_only/ask/auto 工具权限
+│   ├── sandbox.py             # Docker 硬化命令 + 本地 Python 降级执行
 │   ├── graph.py               # LangGraph 同构状态图引擎
 │   ├── llm.py                 # OpenAI 兼容客户端 + 离线 FakeLLM + 多模型路由
 │   ├── agents.py              # 三个智能体节点 / 路由 / 记忆 / 护栏
+│   ├── mcp_server.py          # 只读 MCP server（可选依赖）
 │   ├── evaluation.py          # 评测集 / 消融 / 报告生成
 │   ├── cli.py                 # ingest/ask/chat/eval/graph/serve/demo
 │   ├── server.py              # stdlib HTTP + SSE + 网页版
 │   └── langgraph_adapter.py   # 切到真 LangGraph
+├── skills/                    # SKILL.md（差旅 / 工单 / SQL 报表）
 ├── data/kb/                   # 8 篇制度文档（差旅/考勤/IT/财务/入职/薪酬/产品）
-├── tests/                     # 70 个测试（含 HTTP/SSE 端到端）
+├── tests/                     # 112 个测试（含 HTTP/SSE 端到端）
 ├── var/index/                 # 索引、工单、检查点、评测报告（运行产物）
 ├── requirements.txt · pyproject.toml · .env.example
 └── README.md
@@ -224,8 +292,9 @@ enterprise-agent/
 - 离线 `FakeLLM` 是**规则替身**，只用于跑通链路与做回归测试；它的"意图判断"是正则，不代表真实模型的泛化能力。
 - 哈希向量不是语义模型，检索质量的真实上限要在接入 `text-embedding-v3` / BGE-M3 后重测。
 - 未做：多轮指代改写（"那病假呢"这类省略主语的追问）、知识库增量更新与删除、RAGAS 式 faithfulness 评测、真实模型下的端到端延迟。
-- 未做：`action_id` 持久化 —— 待确认动作存在内存里，进程重启就失效，要真正用于生产得落库并加过期时间。
-- `create_ticket` 的确认目前是"应用层 interrupt"（图停下来 + 显式 confirm），真 LangGraph 下可换成原生 `interrupt()`，adapter 里已注明。
+- 已做：LangGraph 运行时用原生 `interrupt()` 暂停；pending action 通过 checkpointer + `var/index/pending_threads.json` 跨重启恢复。
+- 未做：待确认动作的过期清理与多实例并发锁；Harness 的 step 状态是单写者 JSON，不是分布式事务。
+- `create_ticket` 在 LangGraph 运行时走 `approval` 节点；custom 运行时保留应用层 `confirm`。两条路径都禁止未确认写入。
 
 ## 十、License
 
